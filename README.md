@@ -14,6 +14,9 @@ Unternehmensdaten liegen in Silos: ERP, CRM, Buchhaltung, Excel-Listen. Manuelle
 
 Ein MCP-Server, der LLM-Agenten direkten Zugriff auf Geschäftsdaten gibt. Connectors für gängige Systeme + ein Trust Layer für Datenqualität und Compliance.
 
+## Architecture
+<img width="2752" height="1536" alt="DataTrust Architecture" src="https://github.com/user-attachments/assets/74e9fa4a-2104-4501-8001-440f3a36efd6" />
+
 ## Features
 
 | Feature | Beschreibung | MCP Tool |
