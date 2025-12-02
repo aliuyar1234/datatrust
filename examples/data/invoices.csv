@@ -1,0 +1,6 @@
+invoice_id,customer,amount,currency,date,status
+INV-001,ACME Corp,1500.00,EUR,2024-01-15,paid
+INV-002,TechStart GmbH,2340.50,EUR,2024-01-18,pending
+INV-003,Alpine Solutions,890.00,EUR,2024-01-22,paid
+INV-004,DataFlow AG,4200.00,EUR,2024-02-01,pending
+INV-005,ACME Corp,750.00,EUR,2024-02-05,overdue

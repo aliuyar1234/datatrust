@@ -1,0 +1,41 @@
+{
+  "name": "@datatrust/connector-db",
+  "version": "0.1.0",
+  "description": "Database connectors for PostgreSQL and MySQL",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aliuyar1234/datatrust.git",
+    "directory": "packages/connector-db"
+  },
+  "homepage": "https://github.com/aliuyar1234/datatrust",
+  "author": "Ali Uyar <ali.uyar1@hotmail.com>",
+  "license": "BSL-1.1",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@datatrust/core": "workspace:*",
+    "pg": "^8.13.1",
+    "mysql2": "^3.11.5"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.2",
+    "rimraf": "^6.0.1",
+    "vitest": "^1.6.0"
+  },
+  "peerDependencies": {
+    "@datatrust/core": "workspace:*"
+  }
+}

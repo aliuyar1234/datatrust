@@ -1,0 +1,35 @@
+{
+  "name": "@datatrust/core",
+  "version": "0.1.0",
+  "description": "Core interfaces and utilities for DataTrust connectors",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aliuyar1234/datatrust.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/aliuyar1234/datatrust",
+  "author": "Ali Uyar <ali.uyar1@hotmail.com>",
+  "license": "BSL-1.1",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rimraf dist",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "rimraf": "^6.0.0"
+  }
+}

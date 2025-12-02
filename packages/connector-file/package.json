@@ -1,0 +1,41 @@
+{
+  "name": "@datatrust/connector-file",
+  "version": "0.1.0",
+  "description": "File-based connectors (CSV, Excel, JSON) for DataTrust",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aliuyar1234/datatrust.git",
+    "directory": "packages/connector-file"
+  },
+  "homepage": "https://github.com/aliuyar1234/datatrust",
+  "author": "Ali Uyar <ali.uyar1@hotmail.com>",
+  "license": "BSL-1.1",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rimraf dist",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@datatrust/core": "workspace:*",
+    "csv-parse": "^5.6.0",
+    "csv-stringify": "^6.5.0",
+    "exceljs": "^4.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "rimraf": "^6.0.0",
+    "@types/node": "^22.0.0",
+    "vitest": "^1.6.0"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "@datatrust/connector-api",
+  "version": "0.1.0",
+  "description": "API-based connectors (Odoo, HubSpot, REST) for DataTrust",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aliuyar1234/datatrust.git",
+    "directory": "packages/connector-api"
+  },
+  "homepage": "https://github.com/aliuyar1234/datatrust",
+  "author": "Ali Uyar <ali.uyar1@hotmail.com>",
+  "license": "BSL-1.1",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rimraf dist",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@datatrust/core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "rimraf": "^6.0.0",
+    "@types/node": "^22.0.0"
+  }
+}

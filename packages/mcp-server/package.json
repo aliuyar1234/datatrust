@@ -1,0 +1,46 @@
+{
+  "name": "@datatrust/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP Server for DataTrust Enterprise Connectors",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "datatrust": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aliuyar1234/datatrust.git",
+    "directory": "packages/mcp-server"
+  },
+  "homepage": "https://github.com/aliuyar1234/datatrust",
+  "author": "Ali Uyar <ali.uyar1@hotmail.com>",
+  "license": "BSL-1.1",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rimraf dist",
+    "lint": "eslint src",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@datatrust/core": "workspace:*",
+    "@datatrust/connector-file": "workspace:*",
+    "@datatrust/connector-api": "workspace:*",
+    "@datatrust/connector-db": "workspace:*",
+    "@datatrust/trust-core": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "rimraf": "^6.0.0",
+    "@types/node": "^22.0.0"
+  }
+}

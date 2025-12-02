@@ -1,0 +1,22 @@
+{
+  "server": {
+    "name": "mcp-enterprise-connectors",
+    "version": "0.1.0"
+  },
+  "connectors": [
+    {
+      "id": "invoices",
+      "name": "Invoice Data",
+      "type": "csv",
+      "filePath": "./examples/data/invoices.csv",
+      "readonly": false
+    },
+    {
+      "id": "customers",
+      "name": "Customer Database",
+      "type": "json",
+      "filePath": "./examples/data/customers.json",
+      "readonly": false
+    }
+  ]
+}
