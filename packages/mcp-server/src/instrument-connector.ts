@@ -1,7 +1,37 @@
-import type { IConnector, FilterOptions, ReadResult, Schema, ValidationResult, WriteResult } from '@datatrust/core';
+import type {
+  IConnector,
+  FilterOptions,
+  ReadResult,
+  Schema,
+  ValidationResult,
+  WriteResult,
+} from '@datatrust/core';
+import { ConnectorError } from '@datatrust/core';
 import type { Logger } from './logger.js';
 import { getTelemetry } from './telemetry.js';
 import { metrics } from './metrics.js';
+import { Semaphore } from './semaphore.js';
+import { CircuitBreaker, type CircuitBreakerConfig } from './circuit-breaker.js';
+import { withRetries, type RetryConfig } from './retry.js';
+import { withTimeout } from './timeout.js';
+import {
+  attachCircuitBreaker,
+  recordConnectorConcurrency,
+  recordConnectorError,
+  recordConnectorSuccess,
+} from './connector-health.js';
+
+export type ConnectorRuntimeConfig = {
+  maxConcurrency?: number;
+  timeoutMs?: number;
+  retries?: RetryConfig;
+  circuitBreaker?: CircuitBreakerConfig;
+};
+
+export type InstrumentConnectorOptions = {
+  runtime?: ConnectorRuntimeConfig;
+  defaults?: ConnectorRuntimeConfig;
+};
 
 type ConnectorMethod =
   | 'connect'
@@ -11,6 +41,34 @@ type ConnectorMethod =
   | 'writeRecords'
   | 'validateRecords'
   | 'testConnection';
+
+function isRetryableConnectorError(err: unknown): boolean {
+  if (err instanceof ConnectorError) {
+    return (
+      err.code === 'TIMEOUT' ||
+      err.code === 'CONNECTION_FAILED' ||
+      err.code === 'RATE_LIMITED'
+    );
+  }
+
+  const code = (err as { code?: unknown })?.code;
+  return (
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    code === 'ECONNREFUSED' ||
+    code === 'EAI_AGAIN'
+  );
+}
+
+function canRetryMethod(method: ConnectorMethod): boolean {
+  return (
+    method === 'connect' ||
+    method === 'testConnection' ||
+    method === 'getSchema' ||
+    method === 'readRecords' ||
+    method === 'validateRecords'
+  );
+}
 
 function summarizeCall(method: ConnectorMethod, args: unknown[]): Record<string, unknown> {
   if (method === 'readRecords') {
@@ -36,7 +94,11 @@ function summarizeCall(method: ConnectorMethod, args: unknown[]): Record<string,
   return {};
 }
 
-export function instrumentConnector(connector: IConnector, logger: Logger): IConnector {
+export function instrumentConnector(
+  connector: IConnector,
+  logger: Logger,
+  options?: InstrumentConnectorOptions
+): IConnector {
   const methods = new Set<ConnectorMethod>([
     'connect',
     'disconnect',
@@ -46,6 +108,19 @@ export function instrumentConnector(connector: IConnector, logger: Logger): ICon
     'validateRecords',
     'testConnection',
   ]);
+
+  const connectorId = (connector as any).config?.id ?? 'unknown';
+  const maxConcurrency =
+    options?.runtime?.maxConcurrency ?? options?.defaults?.maxConcurrency ?? 10;
+  const timeoutMs =
+    options?.runtime?.timeoutMs ?? options?.defaults?.timeoutMs ?? 60_000;
+  const retries = options?.runtime?.retries ?? options?.defaults?.retries;
+  const breakerConfig =
+    options?.runtime?.circuitBreaker ?? options?.defaults?.circuitBreaker;
+
+  const semaphore = new Semaphore(maxConcurrency);
+  const breaker = CircuitBreaker.fromConfig(breakerConfig);
+  if (breaker) attachCircuitBreaker(connectorId, breaker);
 
   return new Proxy(connector as unknown as Record<string, unknown>, {
     get(target, prop) {
@@ -61,11 +136,53 @@ export function instrumentConnector(connector: IConnector, logger: Logger): ICon
         const traceId = ctx?.traceId;
         const tool = ctx?.tool;
 
-        const connectorId = (connector as any).config?.id ?? 'unknown';
+        const breakerNow = Date.now();
+        if (breaker && !breaker.canRequest(breakerNow)) {
+          const snap = breaker.getSnapshot(breakerNow);
+          const err = new ConnectorError({
+            code: 'CONNECTION_FAILED',
+            message: `Circuit breaker is open for connector '${connectorId}'`,
+            connectorId,
+            suggestion: `Wait and retry later (breaker state: ${snap.mode}).`,
+            context: { circuitBreaker: snap, operation: method },
+          });
+          recordConnectorError(connectorId, err);
+          throw err;
+        }
+        breaker?.onStart();
+
+        const queuedAt = Date.now();
+        const release = await semaphore.acquire();
+        const waitMs = Date.now() - queuedAt;
+        metrics.observeConnectorQueueWait(connectorId, method, waitMs);
+        metrics.setConnectorInFlight(connectorId, semaphore.inFlight);
+        metrics.setConnectorQueueDepth(connectorId, semaphore.queueDepth);
+        recordConnectorConcurrency(connectorId, semaphore.inFlight, semaphore.queueDepth);
+
         const start = Date.now();
         try {
-          const result = await value.apply(connector, args);
+          const result = await withRetries(
+            async () =>
+              await withTimeout(
+                Promise.resolve(value.apply(connector, args)),
+                timeoutMs,
+                () =>
+                  new ConnectorError({
+                    code: 'TIMEOUT',
+                    message: `Connector call '${method}' timed out after ${timeoutMs}ms`,
+                    connectorId,
+                    suggestion:
+                      'Increase connector.runtime.timeoutMs or server runtime defaults.',
+                    context: { operation: method, timeoutMs },
+                  })
+              ),
+            canRetryMethod(method) ? retries : undefined,
+            isRetryableConnectorError
+          );
+
           const durationMs = Date.now() - start;
+          breaker?.onSuccess();
+          recordConnectorSuccess(connectorId);
           metrics.incConnector(connectorId, method, 'success');
           metrics.observeConnectorDuration(connectorId, method, durationMs);
           logger.debug('Connector call succeeded', {
@@ -74,11 +191,20 @@ export function instrumentConnector(connector: IConnector, logger: Logger): ICon
             connector: connectorId,
             operation: method,
             durationMs,
+            waitMs: waitMs > 0 ? waitMs : undefined,
             ...summarizeCall(method, args),
           });
-          return result as unknown as ReadResult | WriteResult | ValidationResult[] | Schema | void | boolean;
+          return result as unknown as
+            | ReadResult
+            | WriteResult
+            | ValidationResult[]
+            | Schema
+            | void
+            | boolean;
         } catch (err) {
           const durationMs = Date.now() - start;
+          breaker?.onFailure();
+          recordConnectorError(connectorId, err);
           metrics.incConnector(connectorId, method, 'error');
           metrics.observeConnectorDuration(connectorId, method, durationMs);
           logger.warn('Connector call failed', {
@@ -87,10 +213,16 @@ export function instrumentConnector(connector: IConnector, logger: Logger): ICon
             connector: connectorId,
             operation: method,
             durationMs,
+            waitMs: waitMs > 0 ? waitMs : undefined,
             ...summarizeCall(method, args),
             error: err,
           });
           throw err;
+        } finally {
+          release();
+          metrics.setConnectorInFlight(connectorId, semaphore.inFlight);
+          metrics.setConnectorQueueDepth(connectorId, semaphore.queueDepth);
+          recordConnectorConcurrency(connectorId, semaphore.inFlight, semaphore.queueDepth);
         }
       };
     },

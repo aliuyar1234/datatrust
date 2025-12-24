@@ -6,15 +6,19 @@
  *   datatrust --config ./config.json
  */
 
+import { createHmac, timingSafeEqual, verify } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { runServer, registry } from './server.js';
 import {
   configFileSchema,
   expandEnvVars,
+  policySchema,
   formatZodError,
   type ConfigFile,
   type ConnectorEntry,
+  type PolicyBundleConfig,
+  type PolicyConfig,
 } from './config.js';
 import { Logger } from './logger.js';
 import { instrumentConnector } from './instrument-connector.js';
@@ -25,6 +29,102 @@ import {
 } from '@datatrust/connector-file';
 import { createOdooConnector, createHubSpotConnector } from '@datatrust/connector-api';
 import { createPostgresConnector, createMySQLConnector } from '@datatrust/connector-db';
+
+function stripUtf8BomBytes(input: Uint8Array): Uint8Array {
+  if (input.length >= 3 && input[0] === 0xef && input[1] === 0xbb && input[2] === 0xbf) {
+    return input.slice(3);
+  }
+  return input;
+}
+
+function decodeBinaryFromEnv(raw: string): Buffer {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('hex:')) return Buffer.from(trimmed.slice(4), 'hex');
+  if (trimmed.startsWith('base64:')) return Buffer.from(trimmed.slice(7), 'base64');
+  return Buffer.from(trimmed, 'base64');
+}
+
+function decodeHmacSecret(raw: string): string | Buffer {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('hex:')) return Buffer.from(trimmed.slice(4), 'hex');
+  if (trimmed.startsWith('base64:')) return Buffer.from(trimmed.slice(7), 'base64');
+  return trimmed;
+}
+
+function normalizePem(value: string): string {
+  // Common pattern when embedding PEMs in env vars.
+  return value.includes('\\n') ? value.replace(/\\n/g, '\n') : value;
+}
+
+function formatZodIssues(
+  label: string,
+  err: { issues: Array<{ path: Array<string | number>; message: string }> }
+): string {
+  const issues = err.issues
+    .map((issue) => {
+      const path = issue.path.length ? issue.path.join('.') : '(root)';
+      return `- ${path}: ${issue.message}`;
+    })
+    .join('\n');
+  return `${label}:\n${issues}`;
+}
+
+async function loadPublicKey(config: NonNullable<PolicyBundleConfig>): Promise<string> {
+  if (config.publicKeyEnv) {
+    const raw = process.env[config.publicKeyEnv];
+    if (!raw) throw new Error(`Missing required environment variable: ${config.publicKeyEnv}`);
+    return normalizePem(raw);
+  }
+
+  if (config.publicKeyFile) {
+    return await readFile(resolve(process.cwd(), config.publicKeyFile), 'utf-8');
+  }
+
+  throw new Error('policyBundle requires publicKeyFile or publicKeyEnv');
+}
+
+async function loadSignedPolicyBundle(config: NonNullable<PolicyBundleConfig>): Promise<PolicyConfig> {
+  const rawSignature = process.env[config.signatureEnv];
+  if (!rawSignature) {
+    throw new Error(`Missing required environment variable: ${config.signatureEnv}`);
+  }
+  const signature = decodeBinaryFromEnv(rawSignature);
+
+  const absolutePath = resolve(process.cwd(), config.path);
+  const fileBytes = stripUtf8BomBytes(await readFile(absolutePath));
+
+  const alg = config.algorithm ?? 'hmac-sha256';
+  if (alg === 'hmac-sha256') {
+    const secretEnv = config.hmacSecretEnv;
+    if (!secretEnv) throw new Error('policyBundle.hmacSecretEnv is required for hmac-sha256');
+    const rawSecret = process.env[secretEnv];
+    if (!rawSecret) throw new Error(`Missing required environment variable: ${secretEnv}`);
+    const secret = decodeHmacSecret(rawSecret);
+    const digest = createHmac('sha256', secret).update(fileBytes).digest();
+    if (signature.length !== digest.length || !timingSafeEqual(signature, digest)) {
+      throw new Error('Invalid policy bundle signature (hmac-sha256)');
+    }
+  } else if (alg === 'rsa-sha256') {
+    const publicKey = await loadPublicKey(config);
+    const ok = verify('RSA-SHA256', fileBytes, publicKey, signature);
+    if (!ok) throw new Error('Invalid policy bundle signature (rsa-sha256)');
+  } else if (alg === 'ed25519') {
+    const publicKey = await loadPublicKey(config);
+    const ok = verify(null, fileBytes, publicKey, signature);
+    if (!ok) throw new Error('Invalid policy bundle signature (ed25519)');
+  } else {
+    const exhaustive: never = alg;
+    throw new Error(`Unsupported policy bundle algorithm: ${exhaustive}`);
+  }
+
+  const parsed = JSON.parse(Buffer.from(fileBytes).toString('utf-8')) as unknown;
+  const expanded = expandEnvVars(parsed);
+  const result = policySchema.safeParse(expanded);
+  if (!result.success) {
+    throw new Error(formatZodIssues('Invalid policy bundle', result.error));
+  }
+  return result.data;
+}
 
 async function loadConfig(configPath: string): Promise<ConfigFile> {
   const absolutePath = resolve(process.cwd(), configPath);
@@ -37,7 +137,15 @@ async function loadConfig(configPath: string): Promise<ConfigFile> {
   if (!result.success) {
     throw new Error(formatZodError(result.error));
   }
-  return result.data;
+
+  const config = result.data;
+  const policyBundle = config.server?.policyBundle;
+  if (policyBundle) {
+    const policy = await loadSignedPolicyBundle(policyBundle);
+    config.server = { ...(config.server ?? {}), policy };
+  }
+
+  return config;
 }
 
 function createConnector(entry: ConnectorEntry) {
@@ -182,7 +290,10 @@ async function main(): Promise<void> {
     });
 
     for (const entry of config.connectors) {
-      const connector = instrumentConnector(createConnector(entry), logger);
+      const connector = instrumentConnector(createConnector(entry), logger, {
+        runtime: entry.runtime,
+        defaults: config.server?.runtime?.connectorDefaults,
+      });
       registry.register(connector);
     }
 
@@ -194,7 +305,10 @@ async function main(): Promise<void> {
       transport: config.server?.transport,
       http: config.server?.http,
       policy: config.server?.policy,
+      policyBundle: config.server?.policyBundle,
+      tenants: config.server?.tenants,
       logging: config.server?.logging,
+      runtime: config.server?.runtime,
       logger,
     });
   } catch (error) {

@@ -5,7 +5,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
+import { resolve as resolvePath } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -14,7 +17,16 @@ import { ConnectorError } from '@datatrust/core';
 import { createConsistencyMonitor, createChangeDetector, createAuditLogger, createReconciliationEngine, MCPFormatter, TrustError } from '@datatrust/trust-core';
 import type { FieldMapping, KeyFieldConfig, ChangeDetectorOptions, AuditQueryOptions, AuditOperation, MatchingRule, ReconciliationOptions, RuleOperator } from '@datatrust/trust-core';
 import { registry } from './connector-registry.js';
-import type { PolicyConfig } from './config.js';
+import { listConnectorHealth } from './connector-health.js';
+import type {
+  PolicyConfig,
+  PolicyBundleConfig,
+  ServerRuntimeConfig,
+  TenantConfig,
+  HttpTlsConfig,
+  HttpAuthConfig,
+  HttpRateLimitConfig,
+} from './config.js';
 import { Logger, createTraceId } from './logger.js';
 import { PolicyAuditStore } from './policy-audit-store.js';
 import {
@@ -24,8 +36,17 @@ import {
   maskRecord,
   maskRecords,
 } from './policy.js';
-import { getTraceId, runWithTelemetry } from './telemetry.js';
+import { getTelemetry, getTraceId, runWithTelemetry } from './telemetry.js';
 import { metrics } from './metrics.js';
+import { Semaphore } from './semaphore.js';
+import { withTimeout } from './timeout.js';
+import { RateLimiter } from './rate-limiter.js';
+import {
+  buildHttpAuth,
+  authenticateHttpRequest,
+  HttpAuthError,
+  type AuthContext,
+} from './http-auth.js';
 
 export interface ServerConfig {
   name: string;
@@ -37,13 +58,21 @@ export interface ServerConfig {
     path?: string;
     metricsPath?: string;
     healthPath?: string;
+    adminPath?: string;
+    maxRequestBytes?: number;
+    rateLimit?: HttpRateLimitConfig;
     bearerTokenEnv?: string;
+    tls?: HttpTlsConfig;
+    auth?: HttpAuthConfig;
   };
   policy?: PolicyConfig;
+  policyBundle?: PolicyBundleConfig;
+  tenants?: Record<string, TenantConfig>;
   logging?: {
     format?: 'text' | 'json';
     level?: 'debug' | 'info' | 'warn' | 'error';
   };
+  runtime?: ServerRuntimeConfig;
   logger?: Logger;
 }
 
@@ -62,23 +91,36 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /** Helper to create a success result */
-function success(data: unknown) {
+function success(data: unknown, options?: { isError?: boolean }) {
   const traceId = getTraceId();
+  const policyDecisionId = getTelemetry()?.policyDecisionId;
+  const meta =
+    traceId || policyDecisionId
+      ? {
+          ...(traceId ? { trace_id: traceId } : {}),
+          ...(policyDecisionId ? { policy_decision_id: policyDecisionId } : {}),
+        }
+      : undefined;
   const payload =
-    traceId && isPlainObject(data)
-      ? { trace_id: traceId, ...data }
-      : traceId
-        ? { trace_id: traceId, data }
+    meta && isPlainObject(data)
+      ? { ...meta, ...data }
+      : meta
+        ? { ...meta, data }
         : data;
   return {
     content: [textContent(JSON.stringify(payload, null, 2))],
+    ...(options?.isError ? { isError: true } : {}),
   };
 }
 
 /** Helper to create an error result */
 function error(message: string) {
   const traceId = getTraceId();
-  const output = traceId ? `${message}\ntrace_id: ${traceId}` : message;
+  const policyDecisionId = getTelemetry()?.policyDecisionId;
+  const lines = [message];
+  if (traceId) lines.push(`trace_id: ${traceId}`);
+  if (policyDecisionId) lines.push(`policy_decision_id: ${policyDecisionId}`);
+  const output = lines.join('\n');
   return {
     content: [textContent(output)],
     isError: true,
@@ -96,6 +138,21 @@ function formatError(err: unknown) {
           ? err.message
           : String(err);
   return error(message);
+}
+
+function annotateTextOutput(text: string): string {
+  const traceId = getTraceId();
+  const policyDecisionId = getTelemetry()?.policyDecisionId;
+  if (!traceId && !policyDecisionId) return text;
+
+  const header = [
+    traceId ? `trace_id: ${traceId}` : undefined,
+    policyDecisionId ? `policy_decision_id: ${policyDecisionId}` : undefined,
+  ]
+    .filter((v): v is string => Boolean(v))
+    .join('\n');
+
+  return `${header}\n\n${text}`;
 }
 
 const FORBIDDEN_RECORD_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
@@ -176,10 +233,29 @@ export async function createServer(config: ServerConfig): Promise<McpServer> {
       format: config.logging?.format,
     });
   const policy = config.policy;
+  const tenants = config.tenants;
   const policyAudit =
     policy?.audit?.enabled === true
-      ? new PolicyAuditStore(policy.audit.logDir ?? './.policy-audit')
+      ? new PolicyAuditStore({
+          baseDir: policy.audit.logDir ?? './.policy-audit',
+          retentionDays: policy.audit.retentionDays,
+          maxFileBytes: policy.audit.maxFileBytes,
+          remote: policy.audit.remote
+            ? {
+                url: policy.audit.remote.url,
+                bearerTokenEnv: policy.audit.remote.bearerTokenEnv,
+                timeoutMs: policy.audit.remote.timeoutMs,
+                headers: policy.audit.remote.headers,
+              }
+            : undefined,
+        })
       : null;
+  (server as any).__policyAudit = policyAudit;
+
+  const toolSemaphore = new Semaphore(config.runtime?.maxToolConcurrency ?? 25);
+  const toolTimeoutMs = config.runtime?.toolTimeoutMs ?? 120_000;
+  const toolWaiting = new Map<string, number>();
+  const toolInFlight = new Map<string, number>();
 
   const summarizeToolArgs = (tool: string, args: unknown): Record<string, unknown> => {
     const obj = typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {};
@@ -248,6 +324,68 @@ export async function createServer(config: ServerConfig): Promise<McpServer> {
     return {};
   };
 
+  const summarizePolicyInput = (tool: string, args: unknown) => {
+    const obj = typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {};
+
+    if (tool === 'write_records') {
+      const records = Array.isArray(obj['records']) ? (obj['records'] as unknown[]) : [];
+      const writeMode =
+        obj['mode'] === 'insert' || obj['mode'] === 'update' || obj['mode'] === 'upsert'
+          ? (obj['mode'] as 'insert' | 'update' | 'upsert')
+          : 'upsert';
+
+      const recordFields = new Set<string>();
+      for (const record of records) {
+        if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
+        for (const key of Object.keys(record as Record<string, unknown>)) {
+          recordFields.add(key);
+          if (recordFields.size >= 500) break;
+        }
+        if (recordFields.size >= 500) break;
+      }
+
+      return {
+        writeMode,
+        recordCount: records.length,
+        recordFields: recordFields.size > 0 ? Array.from(recordFields) : undefined,
+      };
+    }
+
+    if (tool === 'read_records') {
+      const selectFields = Array.isArray(obj['select'])
+        ? (obj['select'] as unknown[]).filter((v): v is string => typeof v === 'string')
+        : undefined;
+      const whereFields = Array.isArray(obj['where'])
+        ? (obj['where'] as unknown[])
+            .map((w) =>
+              w && typeof w === 'object' && !Array.isArray(w) ? (w as { field?: unknown }).field : undefined
+            )
+            .filter((v): v is string => typeof v === 'string')
+        : undefined;
+
+      return { selectFields, whereFields };
+    }
+
+    if (tool === 'reconcile_records') {
+      const recordFields = new Set<string>();
+      const rules = Array.isArray(obj['rules']) ? (obj['rules'] as unknown[]) : [];
+      for (const rule of rules) {
+        if (!rule || typeof rule !== 'object' || Array.isArray(rule)) continue;
+        const r = rule as { source_field?: unknown; target_field?: unknown };
+        if (typeof r.source_field === 'string') recordFields.add(r.source_field);
+        if (typeof r.target_field === 'string') recordFields.add(r.target_field);
+        if (recordFields.size >= 200) break;
+      }
+
+      return {
+        recordCount: typeof obj['max_records'] === 'number' ? obj['max_records'] : undefined,
+        recordFields: recordFields.size > 0 ? Array.from(recordFields) : undefined,
+      };
+    }
+
+    return undefined;
+  };
+
   const registerTool = (
     toolName: string,
     definition: any,
@@ -256,37 +394,74 @@ export async function createServer(config: ServerConfig): Promise<McpServer> {
   ) => {
     server.registerTool(toolName, definition, async (args: any) => {
       const connectors = connectorsFromArgs(args);
-      const traceId = createTraceId();
+      const parent = getTelemetry();
+      const traceId = parent?.traceId ?? createTraceId();
+      const decisionId = randomUUID();
+      const telemetryCtx = {
+        traceId,
+        tool: toolName,
+        connectors,
+        policyDecisionId: decisionId,
+        policyMaskFields: undefined as string[] | undefined,
+        auth: parent?.auth,
+        breakGlass: parent?.breakGlass,
+        remoteIp: parent?.remoteIp,
+      };
 
-      return runWithTelemetry({ traceId, tool: toolName, connectors }, async () => {
+      return runWithTelemetry(telemetryCtx, async () => {
         const approvalToken =
-          toolName === 'write_records' ? (args?.approval_token as string | undefined) : undefined;
-        const decision = evaluatePolicy(policy, {
+          toolName === 'write_records'
+            ? (args?.approval_token as string | undefined)
+            : undefined;
+        const decision = await evaluatePolicy(policy, {
+          decision_id: decisionId,
+          trace_id: traceId,
           tool: toolName,
           connectors,
+          input: summarizePolicyInput(toolName, args),
           approvalToken,
+          auth: telemetryCtx.auth,
+          breakGlass: telemetryCtx.breakGlass,
+          tenants,
         });
+        telemetryCtx.policyMaskFields = decision.mask_fields;
 
         if (policyAudit) {
           try {
             await policyAudit.append({
-              id: randomUUID(),
+              decision_id: decision.decision_id,
               timestamp: new Date(),
-              traceId,
-              decision: decision.allowed ? 'allow' : 'deny',
+              trace_id: traceId,
+              policy_version: decision.policy_version,
               tool: toolName,
               connectors,
+              decision: decision.allowed ? 'allow' : 'deny',
               reason: decision.reason,
+              rule_id: decision.rule_id,
+              subject:
+                telemetryCtx.auth?.kind === 'jwt'
+                  ? telemetryCtx.auth.subject
+                  : telemetryCtx.auth?.kind === 'bearer'
+                    ? telemetryCtx.auth.subject
+                    : undefined,
+              tenant: telemetryCtx.auth?.kind === 'jwt' ? telemetryCtx.auth.tenantId : undefined,
+              break_glass: decision.break_glass,
               request: summarizeToolArgs(toolName, args),
             });
           } catch (err) {
-            logger.warn('Failed to write policy audit entry', { traceId, tool: toolName, error: err });
+            logger.warn('Failed to write policy audit entry', {
+              traceId,
+              policyDecisionId: decision.decision_id,
+              tool: toolName,
+              error: err,
+            });
           }
         }
 
         if (!decision.allowed) {
           logger.warn('Policy denied tool invocation', {
             traceId,
+            policyDecisionId: decision.decision_id,
             tool: toolName,
             connectors,
             reason: decision.reason,
@@ -295,34 +470,65 @@ export async function createServer(config: ServerConfig): Promise<McpServer> {
           return error(`Denied by policy: ${decision.reason}`);
         }
 
-        const start = Date.now();
-        try {
-          const result = await handler(args);
-          const durationMs = Date.now() - start;
-          metrics.observeToolDuration(toolName, durationMs);
-          metrics.incTool(toolName, result?.isError ? 'error' : 'success');
-          logger.info('Tool invocation completed', {
+        const waited = (toolWaiting.get(toolName) ?? 0) + 1;
+         toolWaiting.set(toolName, waited);
+         metrics.setToolQueueDepth(toolName, waited);
+
+         const queuedAt = Date.now();
+         const release = await toolSemaphore.acquire();
+         const waitMs = Date.now() - queuedAt;
+         metrics.observeToolQueueWait(toolName, waitMs);
+
+         const afterWait = (toolWaiting.get(toolName) ?? 1) - 1;
+         toolWaiting.set(toolName, afterWait);
+         metrics.setToolQueueDepth(toolName, afterWait);
+
+         const inFlightNow = (toolInFlight.get(toolName) ?? 0) + 1;
+         toolInFlight.set(toolName, inFlightNow);
+         metrics.setToolInFlight(toolName, inFlightNow);
+
+         const start = Date.now();
+         try {
+           const result = await withTimeout(
+             handler(args),
+             toolTimeoutMs,
+             () => new Error(`Tool '${toolName}' timed out after ${toolTimeoutMs}ms`)
+           );
+           const durationMs = Date.now() - start;
+           metrics.observeToolDuration(toolName, durationMs);
+           metrics.incTool(toolName, result?.isError ? 'error' : 'success');
+            logger.info('Tool invocation completed', {
             traceId,
-            tool: toolName,
-            connectors,
-            durationMs,
-            outcome: result?.isError ? 'error' : 'success',
-          });
-          return result;
-        } catch (err) {
-          const durationMs = Date.now() - start;
+              policyDecisionId: decision.decision_id,
+              tool: toolName,
+              connectors,
+              durationMs,
+              waitMs: waitMs > 0 ? waitMs : undefined,
+              outcome: result?.isError ? 'error' : 'success',
+            });
+           return result;
+         } catch (err) {
+           const durationMs = Date.now() - start;
           metrics.observeToolDuration(toolName, durationMs);
           metrics.incTool(toolName, 'error');
-          logger.error('Tool invocation failed', {
+           logger.error('Tool invocation failed', {
             traceId,
-            tool: toolName,
-            connectors,
-            durationMs,
-            error: err,
-          });
-          return formatError(err);
+             policyDecisionId: decision.decision_id,
+             tool: toolName,
+             connectors,
+             durationMs,
+             waitMs: waitMs > 0 ? waitMs : undefined,
+             error: err,
+           });
+           return formatError(err);
+         } finally {
+           release();
+           const inFlight = (toolInFlight.get(toolName) ?? 1) - 1;
+           toolInFlight.set(toolName, inFlight);
+           metrics.setToolInFlight(toolName, inFlight);
         }
-      });
+      }
+      );
     });
   };
 
@@ -421,6 +627,7 @@ Example: {"where": [{"field": "amount", "op": "gt", "value": 1000}], "limit": 10
     async (args) => {
       try {
         const connector = registry.getOrThrow(args.connector_id);
+        const extraMaskFields = getTelemetry()?.policyMaskFields;
 
         if (connector.state !== 'connected') {
           return error(`Connector '${args.connector_id}' is not connected`);
@@ -444,7 +651,8 @@ Example: {"where": [{"field": "amount", "op": "gt", "value": 1000}], "limit": 10
           ? maskRecords(
               result.records as Array<Record<string, unknown>>,
               args.connector_id,
-              policy
+              policy,
+              extraMaskFields
             )
           : result.records;
         return success({ connector_id: args.connector_id, ...result, records });
@@ -487,6 +695,7 @@ Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount":
     async (args) => {
       try {
         const connector = registry.getOrThrow(args.connector_id);
+        const extraMaskFields = getTelemetry()?.policyMaskFields;
 
         if (connector.state !== 'connected') {
           return error(`Connector '${args.connector_id}' is not connected`);
@@ -512,22 +721,14 @@ Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount":
           .map((result, index) => ({ ...result, index }))
           .filter((result) => !result.valid);
         if (invalid.length > 0) {
-          return {
-            content: [
-              textContent(
-                JSON.stringify(
-                  {
-                    message: 'Validation failed; no records were written.',
-                    invalidCount: invalid.length,
-                    invalid: invalid.slice(0, 20),
-                  },
-                  null,
-                  2
-                )
-              ),
-            ],
-            isError: true,
-          };
+          return success(
+            {
+              message: 'Validation failed; no records were written.',
+              invalidCount: invalid.length,
+              invalid: invalid.slice(0, 20),
+            },
+            { isError: true }
+          );
         }
 
         const result = await connector.writeRecords(
@@ -561,6 +762,7 @@ Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount":
     async (args) => {
       try {
         const connector = registry.getOrThrow(args.connector_id);
+        const extraMaskFields = getTelemetry()?.policyMaskFields;
 
         if (connector.state !== 'connected') {
           return error(`Connector '${args.connector_id}' is not connected`);
@@ -644,6 +846,7 @@ Returns: Summary of matches, differences, and missing records with field-level d
       try {
         const sourceConnector = registry.getOrThrow(args.source_connector_id);
         const targetConnector = registry.getOrThrow(args.target_connector_id);
+        const extraMaskFields = getTelemetry()?.policyMaskFields;
 
         if (sourceConnector.state !== 'connected') {
           return error(`Source connector '${args.source_connector_id}' is not connected`);
@@ -694,18 +897,20 @@ Returns: Summary of matches, differences, and missing records with field-level d
               ? maskRecord(
                   r.sourceRecord as Record<string, unknown>,
                   args.source_connector_id,
-                  policy
+                  policy,
+                  extraMaskFields
                 )
               : undefined,
             targetRecord: r.targetRecord
               ? maskRecord(
                   r.targetRecord as Record<string, unknown>,
                   args.target_connector_id,
-                  policy
+                  policy,
+                  extraMaskFields
                 )
               : undefined,
             differences: r.differences?.map((d) =>
-              isFieldMasked(d.field, args.source_connector_id, policy)
+              isFieldMasked(d.field, args.source_connector_id, policy, extraMaskFields)
                 ? { ...d, sourceValue: replacement, targetValue: replacement }
                 : d
             ),
@@ -713,7 +918,7 @@ Returns: Summary of matches, differences, and missing records with field-level d
         };
 
         const output = formatter.formatAsText(maskedReport);
-        return { content: [textContent(output)] };
+        return { content: [textContent(annotateTextOutput(output))] };
       } catch (err) {
         return formatError(err);
       }
@@ -787,6 +992,7 @@ Returns: Summary of added, modified, deleted records with details.`,
     async (args) => {
       try {
         const connector = registry.getOrThrow(args.connector_id);
+        const extraMaskFields = getTelemetry()?.policyMaskFields;
 
         if (connector.state !== 'connected') {
           return error(`Connector '${args.connector_id}' is not connected`);
@@ -810,19 +1016,25 @@ Returns: Summary of added, modified, deleted records with details.`,
           changes: report.changes.map((c) => ({
             ...c,
             record: c.record
-              ? maskRecord(c.record as Record<string, unknown>, args.connector_id, policy)
+              ? maskRecord(
+                  c.record as Record<string, unknown>,
+                  args.connector_id,
+                  policy,
+                  extraMaskFields
+                )
               : undefined,
             previousRecord: c.previousRecord
               ? maskRecord(
                   c.previousRecord as Record<string, unknown>,
                   args.connector_id,
-                  policy
+                  policy,
+                  extraMaskFields
                 )
               : undefined,
           })),
         };
-        const output = formatter.formatChangeReport(maskedReport);
-        return { content: [textContent(output)] };
+        const output = formatter.formatChangeReport(maskedReport);        
+        return { content: [textContent(annotateTextOutput(output))] };
       } catch (err) {
         return formatError(err);
       }
@@ -972,6 +1184,7 @@ Returns: List of audit entries with operation details, before/after values, and 
       try {
         const auditLogger = createAuditLogger();
         const formatter = new MCPFormatter();
+        const extraMaskFields = getTelemetry()?.policyMaskFields;
 
         const options: AuditQueryOptions = {
           connectorId: args.connector_id,
@@ -989,15 +1202,25 @@ Returns: List of audit entries with operation details, before/after values, and 
           entries: report.entries.map((e) => ({
             ...e,
             before: e.before
-              ? maskRecord(e.before as Record<string, unknown>, e.connectorId, policy)
+              ? maskRecord(
+                  e.before as Record<string, unknown>,
+                  e.connectorId,
+                  policy,
+                  extraMaskFields
+                )
               : undefined,
             after: e.after
-              ? maskRecord(e.after as Record<string, unknown>, e.connectorId, policy)
+              ? maskRecord(
+                  e.after as Record<string, unknown>,
+                  e.connectorId,
+                  policy,
+                  extraMaskFields
+                )
               : undefined,
           })),
         };
         const output = formatter.formatAuditReport(maskedReport);
-        return { content: [textContent(output)] };
+        return { content: [textContent(annotateTextOutput(output))] };
       } catch (err) {
         return formatError(err);
       }
@@ -1111,6 +1334,31 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
           .max(10000)
           .optional()
           .describe('Max records to process (max: 10000)'),
+        blocking_mode: z
+          .enum(['auto', 'configured', 'off'])
+          .optional()
+          .describe(
+            'Optional blocking mode to reduce candidate comparisons (default: auto when possible)'
+          ),
+        blocking_source_field: z
+          .string()
+          .optional()
+          .describe('For blocking_mode=configured: source field used for blocking'),
+        blocking_target_field: z
+          .string()
+          .optional()
+          .describe('For blocking_mode=configured: target field used for blocking'),
+        blocking_algorithm: z
+          .enum(['exact', 'prefix', 'cologne_phonetic', 'soundex'])
+          .optional()
+          .describe('For blocking_mode=configured: blocking algorithm (default: exact)'),
+        blocking_prefix_length: z
+          .number()
+          .int()
+          .min(1)
+          .max(32)
+          .optional()
+          .describe('For blocking_algorithm=prefix: prefix length (default: 4)'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -1118,6 +1366,7 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
       try {
         const sourceConnector = registry.getOrThrow(args.source_connector_id);
         const targetConnector = registry.getOrThrow(args.target_connector_id);
+        const extraMaskFields = getTelemetry()?.policyMaskFields;
 
         if (sourceConnector.state !== 'connected') {
           return error(`Source connector '${args.source_connector_id}' is not connected`);
@@ -1202,12 +1451,14 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
             sourceRecord: maskRecord(
               m.sourceRecord as Record<string, unknown>,
               args.source_connector_id,
-              policy
+              policy,
+              extraMaskFields
             ),
             targetRecord: maskRecord(
               m.targetRecord as Record<string, unknown>,
               args.target_connector_id,
-              policy
+              policy,
+              extraMaskFields
             ),
           })),
           unmatchedSource: report.unmatchedSource.map((u) => ({
@@ -1215,7 +1466,8 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
             record: maskRecord(
               u.record as Record<string, unknown>,
               args.source_connector_id,
-              policy
+              policy,
+              extraMaskFields
             ),
           })),
           unmatchedTarget: report.unmatchedTarget.map((u) => ({
@@ -1223,12 +1475,13 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
             record: maskRecord(
               u.record as Record<string, unknown>,
               args.target_connector_id,
-              policy
+              policy,
+              extraMaskFields
             ),
           })),
         };
         const output = formatter.formatReconciliationReport(maskedReport);
-        return { content: [textContent(output)] };
+        return { content: [textContent(annotateTextOutput(output))] };
       } catch (err) {
         return formatError(err);
       }
@@ -1272,12 +1525,38 @@ export async function runServer(config: ServerConfig): Promise<void> {
     const mcpPath = config.http?.path ?? '/mcp';
     const metricsPath = config.http?.metricsPath ?? '/metrics';
     const healthPath = config.http?.healthPath ?? '/healthz';
+    const adminPath = config.http?.adminPath ?? '/admin/status';
+    const maxRequestBytes = config.http?.maxRequestBytes ?? 5_000_000;
+    const rateLimiter = RateLimiter.fromConfig(config.http?.rateLimit);
 
-    const bearerTokenEnv = config.http?.bearerTokenEnv;
-    const bearerToken = bearerTokenEnv ? process.env[bearerTokenEnv] : undefined;
-    if (bearerTokenEnv && !bearerToken) {
-      throw new Error(`server.http.bearerTokenEnv is set to '${bearerTokenEnv}' but the env var is not set`);
-    }
+    const authModeInferred: NonNullable<HttpAuthConfig['mode']> =
+      config.http?.auth?.mode ??
+      (config.http?.auth?.jwt
+        ? (config.http?.auth?.bearerTokenEnv ?? config.http?.bearerTokenEnv)
+          ? 'bearer_or_jwt'
+          : 'jwt'
+        : (config.http?.auth?.bearerTokenEnv ?? config.http?.bearerTokenEnv)
+          ? 'bearer'
+          : 'none');
+
+    const httpAuth = await buildHttpAuth(
+      config.http?.auth ? { ...config.http.auth, mode: authModeInferred } : { mode: authModeInferred },
+      config.http?.bearerTokenEnv
+    );
+
+    const tls = config.http?.tls;
+    const useTls = tls?.enabled === true;
+    const scheme = useTls ? 'https' : 'http';
+    const tlsOptions =
+      useTls
+        ? {
+            key: await readFile(resolvePath(process.cwd(), tls.keyFile!)),
+            cert: await readFile(resolvePath(process.cwd(), tls.certFile!)),
+            ca: tls.caFile ? await readFile(resolvePath(process.cwd(), tls.caFile)) : undefined,
+            requestCert: tls.requestCert ?? false,
+            rejectUnauthorized: tls.rejectUnauthorized ?? true,
+          }
+        : undefined;
 
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -1285,7 +1564,7 @@ export async function runServer(config: ServerConfig): Promise<void> {
 
     await server.connect(transport);
 
-    const httpServer = createHttpServer(async (req, res) => {
+    const requestHandler = async (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => {
       const sendText = (status: number, body: string, headers?: Record<string, string>) => {
         res.writeHead(status, {
           'Content-Type': 'text/plain; charset=utf-8',
@@ -1295,20 +1574,71 @@ export async function runServer(config: ServerConfig): Promise<void> {
         res.end(body);
       };
 
-      const url = new URL(req.url ?? '/', `http://${host}:${port}`);
+      const url = new URL(req.url ?? '/', `${scheme}://${host}:${port}`);
 
-      if (bearerToken) {
-        const auth = req.headers['authorization'];
-        const expected = `Bearer ${bearerToken}`;
-        if (auth !== expected) {
-          sendText(401, 'Unauthorized');
-          return;
-        }
+      // Basic request size limit (best-effort via Content-Length header).
+      const contentLength = Number(req.headers['content-length'] ?? '0');
+      if (Number.isFinite(contentLength) && contentLength > maxRequestBytes) {
+        sendText(413, 'Request entity too large');
+        return;
       }
 
       if (req.method === 'GET' && url.pathname === healthPath) {
         sendText(200, 'ok');
         return;
+      }
+
+      // mTLS: require valid client certificate when enabled.
+      if (useTls && tls?.requestCert) {
+        const socket = req.socket as any;
+        if (socket.authorized !== true) {
+          sendText(401, 'Unauthorized');
+          return;
+        }
+      }
+
+      let authContext: AuthContext;
+      let breakGlass = false;
+      try {
+        const result = authenticateHttpRequest(req, httpAuth);
+        authContext = result.auth;
+        breakGlass = result.breakGlass;
+      } catch (err) {
+        if (err instanceof HttpAuthError) {
+          sendText(err.status, err.status === 401 ? 'Unauthorized' : 'Forbidden');
+          return;
+        }
+        sendText(401, 'Unauthorized');
+        return;
+      }
+
+      // Optional rate limiting (best-effort, in-memory).
+      if (rateLimiter) {
+        rateLimiter.prune();
+        const ip = req.socket.remoteAddress ?? 'unknown';
+        const subject =
+          authContext.kind === 'jwt'
+            ? authContext.subject
+            : authContext.kind === 'bearer'
+              ? authContext.subject
+              : undefined;
+        const keyMode = config.http?.rateLimit?.key ?? 'ip';
+        const key =
+          keyMode === 'subject'
+            ? subject ?? ip
+            : keyMode === 'ip+subject'
+              ? `${ip}|${subject ?? ''}`
+              : ip;
+        const result = rateLimiter.check(key);
+        res.setHeader('X-RateLimit-Limit', String(result.limit));
+        res.setHeader('X-RateLimit-Remaining', String(result.remaining));
+        res.setHeader('X-RateLimit-Reset', String(Math.floor(result.resetAt / 1000)));
+        if (!result.allowed) {
+          const retryAfter = Math.max(0, Math.ceil((result.resetAt - Date.now()) / 1000));
+          res.setHeader('Retry-After', String(retryAfter));
+          sendText(429, 'Too Many Requests');
+          return;
+        }
       }
 
       if (req.method === 'GET' && url.pathname === metricsPath) {
@@ -1320,13 +1650,81 @@ export async function runServer(config: ServerConfig): Promise<void> {
         return;
       }
 
+      if (req.method === 'GET' && url.pathname === adminPath) {
+        const policyAuditStore = (server as any).__policyAudit as
+          | PolicyAuditStore
+          | null
+          | undefined;
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        res.end(
+          JSON.stringify(
+            {
+              name: config.name,
+              version: config.version,
+              transport: 'http',
+              now: new Date().toISOString(),
+              connectors: registry.list(),
+              connector_health: listConnectorHealth(),
+              audit_sink: policyAuditStore
+                ? { enabled: true, status: policyAuditStore.getStatus() }
+                : { enabled: false },
+              policy: config.policy
+                ? {
+                    version: config.policy.version,
+                    defaultAction: config.policy.defaultAction,
+                    breakGlassEnabled: config.policy.breakGlass?.enabled,
+                  }
+                : undefined,
+              runtime: {
+                maxToolConcurrency: config.runtime?.maxToolConcurrency ?? 25,
+                toolTimeoutMs: config.runtime?.toolTimeoutMs ?? 120_000,
+                maxRequestBytes,
+                rateLimit: config.http?.rateLimit?.enabled ? config.http.rateLimit : { enabled: false },
+                tls: useTls
+                  ? { enabled: true, requestCert: tls?.requestCert ?? false }
+                  : { enabled: false },
+              },
+              auth: { kind: authContext.kind },
+              break_glass: breakGlass,
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
+
       if (url.pathname === mcpPath) {
-        await transport.handleRequest(req as any, res as any);
+        const traceparent = req.headers['traceparent'];
+        const parsedTraceId =
+          typeof traceparent === 'string'
+            ? traceparent.match(/^[0-9a-f]{2}-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$/i)?.[1]
+            : undefined;
+        const traceId = parsedTraceId ?? createTraceId();
+        const remoteIp = req.socket.remoteAddress ?? 'unknown';
+        await runWithTelemetry(
+          {
+            traceId,
+            tool: '__http__',
+            connectors: [],
+            auth: authContext,
+            breakGlass,
+            remoteIp,
+          },
+          async () => await transport.handleRequest(req as any, res as any)
+        );
         return;
       }
 
       sendText(404, 'Not found');
-    });
+    };
+
+    const httpServer = useTls
+      ? createHttpsServer(tlsOptions as any, requestHandler)
+      : createHttpServer(requestHandler);
 
     process.on('SIGINT', () => void shutdown('SIGINT', httpServer));
     process.on('SIGTERM', () => void shutdown('SIGTERM', httpServer));
@@ -1340,9 +1738,10 @@ export async function runServer(config: ServerConfig): Promise<void> {
       name: config.name,
       version: config.version,
       transport: 'http',
-      url: `http://${host}:${port}${mcpPath}`,
-      metrics: `http://${host}:${port}${metricsPath}`,
-      health: `http://${host}:${port}${healthPath}`,
+      url: `${scheme}://${host}:${port}${mcpPath}`,
+      metrics: `${scheme}://${host}:${port}${metricsPath}`,
+      health: `${scheme}://${host}:${port}${healthPath}`,
+      admin: `${scheme}://${host}:${port}${adminPath}`,
       connectors: registry.listIds(),
     });
 

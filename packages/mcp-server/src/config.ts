@@ -65,10 +65,54 @@ export function expandEnvVars<T>(
   return value;
 }
 
+const retryConfigSchema = z
+  .object({
+    attempts: z.number().int().min(1).max(10).optional(),
+    baseDelayMs: z.number().int().min(0).max(60_000).optional(),
+    maxDelayMs: z.number().int().min(0).max(300_000).optional(),
+    jitter: z.number().min(0).max(1).optional(),
+  })
+  .strict();
+
+export type RetryConfig = z.infer<typeof retryConfigSchema>;
+
+const circuitBreakerConfigSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    failureThreshold: z.number().int().min(1).max(100).optional(),
+    openMs: z.number().int().min(1).max(600_000).optional(),
+  })
+  .strict();
+
+export type CircuitBreakerConfig = z.infer<typeof circuitBreakerConfigSchema>;
+
+const connectorRuntimeConfigSchema = z
+  .object({
+    maxConcurrency: z.number().int().min(1).max(1000).optional(),
+    timeoutMs: z.number().int().min(1).max(600_000).optional(),
+    retries: retryConfigSchema.optional(),
+    circuitBreaker: circuitBreakerConfigSchema.optional(),
+  })
+  .strict();
+
+export type ConnectorRuntimeConfig = z.infer<typeof connectorRuntimeConfigSchema>;
+
+export const serverRuntimeConfigSchema = z
+  .object({
+    maxToolConcurrency: z.number().int().min(1).max(1000).optional(),
+    toolTimeoutMs: z.number().int().min(1).max(600_000).optional(),
+    connectorDefaults: connectorRuntimeConfigSchema.optional(),
+  })
+  .strict()
+  .optional();
+
+export type ServerRuntimeConfig = z.infer<typeof serverRuntimeConfigSchema>;
+
 const connectorBase = z.object({
   id: z.string().min(1),
   name: z.string().default(''),
   readonly: z.boolean().optional(),
+  runtime: connectorRuntimeConfigSchema.optional(),
 });
 
 const fileConnectorBase = connectorBase.extend({
@@ -180,11 +224,131 @@ export type ConnectorEntry = z.infer<typeof connectorEntrySchema>;
 
 export const policySchema = z
   .object({
+    version: z.string().min(1).optional(),
     defaultAction: z.enum(['allow', 'deny']).optional(),
     allowTools: z.array(z.string().min(1)).optional(),
     denyTools: z.array(z.string().min(1)).optional(),
     allowConnectors: z.array(z.string().min(1)).optional(),
     denyConnectors: z.array(z.string().min(1)).optional(),
+    rules: z
+      .array(
+        z
+          .object({
+            id: z.string().min(1).optional(),
+            description: z.string().min(1).optional(),
+            when: z
+              .object({
+                tool: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                connectorsAll: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                connectorsAny: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                selectFieldsAny: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                whereFieldsAny: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                recordFieldsAny: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                writeMode: z.enum(['insert', 'update', 'upsert']).optional(),
+                subject: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                tenant: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                rolesAny: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+                scopesAny: z
+                  .union([
+                    z.string().min(1),
+                    z.array(z.string().min(1)).min(1),
+                    z.object({ regex: z.string().min(1) }).strict(),
+                    z
+                      .array(z.object({ regex: z.string().min(1) }).strict())
+                      .min(1),
+                  ])
+                  .optional(),
+              })
+              .strict(),
+            action: z.enum(['allow', 'deny']),
+            requireApproval: z.boolean().optional(),
+            maskFields: z.array(z.string().min(1)).optional(),
+            reason: z.string().min(1).optional(),
+          })
+          .strict()
+      )
+      .optional(),
     masking: z
       .object({
         mode: z.enum(['redact']).optional(),
@@ -197,19 +361,184 @@ export const policySchema = z
       .object({
         mode: z.enum(['allow', 'deny', 'require_approval']).optional(),
         approvalTokenEnv: z.string().min(1).optional(),
+        approvalHook: z
+          .object({
+            url: z.string().min(1),
+            method: z.enum(['POST']).optional(),
+            timeoutMs: z.number().int().min(1).max(120_000).optional(),
+            bearerTokenEnv: z.string().min(1).optional(),
+            headers: z.record(z.string()).optional(),
+          })
+          .strict()
+          .optional(),
       })
       .optional(),
     audit: z
       .object({
         enabled: z.boolean().optional(),
         logDir: z.string().min(1).optional(),
+        retentionDays: z.number().int().min(1).max(3650).optional(),
+        maxFileBytes: z.number().int().min(1).max(1_000_000_000).optional(),
+        remote: z
+          .object({
+            url: z.string().min(1),
+            method: z.enum(['POST']).optional(),
+            timeoutMs: z.number().int().min(1).max(120_000).optional(),
+            bearerTokenEnv: z.string().min(1).optional(),
+            headers: z.record(z.string()).optional(),
+          })
+          .strict()
+          .optional(),
       })
+      .optional(),
+    breakGlass: z
+      .object({
+        enabled: z.boolean().optional(),
+      })
+      .strict()
       .optional(),
   })
   .strict()
   .optional();
 
 export type PolicyConfig = z.infer<typeof policySchema>;
+
+const httpRateLimitSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    windowMs: z.number().int().min(1).max(300_000).optional(),
+    maxRequests: z.number().int().min(1).max(10_000).optional(),
+    key: z.enum(['ip', 'subject', 'ip+subject']).optional(),
+  })
+  .strict();
+
+export type HttpRateLimitConfig = z.infer<typeof httpRateLimitSchema>;
+
+const httpTlsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    keyFile: z.string().min(1).optional(),
+    certFile: z.string().min(1).optional(),
+    caFile: z.string().min(1).optional(),
+    requestCert: z.boolean().optional(),
+    rejectUnauthorized: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.enabled) {
+      if (!value.keyFile) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'server.http.tls.keyFile is required when tls.enabled=true',
+          path: ['keyFile'],
+        });
+      }
+      if (!value.certFile) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'server.http.tls.certFile is required when tls.enabled=true',
+          path: ['certFile'],
+        });
+      }
+    }
+  });
+
+export type HttpTlsConfig = z.infer<typeof httpTlsSchema>;
+
+const jwtAuthSchema = z
+  .object({
+    issuer: z.string().min(1).optional(),
+    audience: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
+    algorithms: z.array(z.enum(['RS256', 'HS256'])).min(1).optional(),
+    clockSkewSeconds: z.number().int().min(0).max(600).optional(),
+    publicKeyFile: z.string().min(1).optional(),
+    publicKeyEnv: z.string().min(1).optional(),
+    hmacSecretEnv: z.string().min(1).optional(),
+    requiredClaims: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+    subjectClaim: z.string().min(1).optional(),
+    tenantClaim: z.string().min(1).optional(),
+    rolesClaim: z.string().min(1).optional(),
+    scopesClaim: z.string().min(1).optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const algorithms = value.algorithms ?? [];
+    const usesRS = algorithms.length === 0 || algorithms.includes('RS256');
+    const usesHS = algorithms.includes('HS256');
+
+    if (usesRS && !value.publicKeyFile && !value.publicKeyEnv) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'JWT RS256 requires publicKeyFile or publicKeyEnv (PEM)',
+        path: ['publicKeyFile'],
+      });
+    }
+    if (usesHS && !value.hmacSecretEnv) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'JWT HS256 requires hmacSecretEnv',
+        path: ['hmacSecretEnv'],
+      });
+    }
+  });
+
+export type JwtAuthConfig = z.infer<typeof jwtAuthSchema>;
+
+const httpAuthSchema = z
+  .object({
+    mode: z.enum(['none', 'bearer', 'jwt', 'bearer_or_jwt']).optional(),
+    bearerTokenEnv: z.string().min(1).optional(),
+    jwt: jwtAuthSchema.optional(),
+    breakGlassTokenEnv: z.string().min(1).optional(),
+    breakGlassHeader: z.string().min(1).optional(),
+  })
+  .strict();
+
+export type HttpAuthConfig = z.infer<typeof httpAuthSchema>;
+
+const policyBundleSchema = z
+  .object({
+    path: z.string().min(1),
+    signatureEnv: z.string().min(1),
+    algorithm: z.enum(['hmac-sha256', 'rsa-sha256', 'ed25519']).optional(),
+    publicKeyFile: z.string().min(1).optional(),
+    publicKeyEnv: z.string().min(1).optional(),
+    hmacSecretEnv: z.string().min(1).optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const alg = value.algorithm ?? 'hmac-sha256';
+    if (alg === 'hmac-sha256') {
+      if (!value.hmacSecretEnv) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'policyBundle.hmacSecretEnv is required for hmac-sha256',
+          path: ['hmacSecretEnv'],
+        });
+      }
+    } else if (alg === 'rsa-sha256' || alg === 'ed25519') {
+      if (!value.publicKeyFile && !value.publicKeyEnv) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `policyBundle requires publicKeyFile or publicKeyEnv for ${alg}`,
+          path: ['publicKeyFile'],
+        });
+      }
+    }
+  })
+  .optional();
+
+export type PolicyBundleConfig = z.infer<typeof policyBundleSchema>;
+
+const tenantConfigSchema = z
+  .object({
+    policy: policySchema,
+  })
+  .strict();
+
+export type TenantConfig = z.infer<typeof tenantConfigSchema>;
 
 export const serverSchema = z
   .object({
@@ -223,11 +552,18 @@ export const serverSchema = z
         path: z.string().min(1).optional(),
         metricsPath: z.string().min(1).optional(),
         healthPath: z.string().min(1).optional(),
+        adminPath: z.string().min(1).optional(),
+        maxRequestBytes: z.number().int().min(1).max(50_000_000).optional(),
+        rateLimit: httpRateLimitSchema.optional(),
         bearerTokenEnv: z.string().min(1).optional(),
+        tls: httpTlsSchema.optional(),
+        auth: httpAuthSchema.optional(),
       })
       .strict()
       .optional(),
     policy: policySchema,
+    policyBundle: policyBundleSchema,
+    tenants: z.record(tenantConfigSchema).optional(),
     logging: z
       .object({
         format: z.enum(['text', 'json']).optional(),
@@ -235,6 +571,7 @@ export const serverSchema = z
       })
       .strict()
       .optional(),
+    runtime: serverRuntimeConfigSchema,
   })
   .strict()
   .optional();
