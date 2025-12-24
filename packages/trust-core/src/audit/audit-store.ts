@@ -14,9 +14,12 @@ import { TrustError } from '../errors/index.js';
  * Manages audit log storage on the filesystem.
  *
  * Entries are stored in daily JSON files for efficient querying by date range.
- * Format: {baseDir}/{connectorId}/{YYYY-MM-DD}.json
+ * Format (new): {baseDir}/{connectorId}/{YYYY-MM-DD}.ndjson (one JSON object per line)
+ * Legacy format: {baseDir}/{connectorId}/{YYYY-MM-DD}.json (array of objects)
  */
 export class AuditStore {
+  private static writeQueue = new Map<string, Promise<void>>();
+
   constructor(private readonly baseDir: string = './.audit-logs') {}
 
   /**
@@ -33,6 +36,11 @@ export class AuditStore {
    */
   private getFilePath(connectorId: string, date: Date): string {
     const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD
+    return path.join(this.getConnectorDir(connectorId), `${dateStr}.ndjson`);
+  }
+
+  private getLegacyFilePath(connectorId: string, date: Date): string {
+    const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD
     return path.join(this.getConnectorDir(connectorId), `${dateStr}.json`);
   }
 
@@ -42,7 +50,7 @@ export class AuditStore {
   private async ensureDir(connectorId: string): Promise<void> {
     const dir = this.getConnectorDir(connectorId);
     try {
-      await fs.mkdir(dir, { recursive: true });
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     } catch (err) {
       throw new TrustError({
         code: 'AUDIT_LOG_ERROR',
@@ -57,23 +65,14 @@ export class AuditStore {
    */
   async append(entry: AuditEntry): Promise<void> {
     await this.ensureDir(entry.connectorId);
-    const filePath = this.getFilePath(entry.connectorId, entry.timestamp);
+    const filePath = this.getFilePath(entry.connectorId, entry.timestamp);      
 
-    // Load existing entries for this day
-    let entries: AuditEntry[] = [];
+    const line = `${JSON.stringify(entry)}\n`;
+
     try {
-      const content = await fs.readFile(filePath, 'utf-8');
-      entries = JSON.parse(content) as AuditEntry[];
-    } catch {
-      // File doesn't exist yet, start with empty array
-    }
-
-    // Append new entry
-    entries.push(entry);
-
-    // Write back
-    try {
-      await fs.writeFile(filePath, JSON.stringify(entries, null, 2), 'utf-8');
+      await this.enqueueWrite(filePath, async () => {
+        await fs.appendFile(filePath, line, { encoding: 'utf-8', mode: 0o600 });
+      });
     } catch (err) {
       throw new TrustError({
         code: 'AUDIT_LOG_ERROR',
@@ -107,19 +106,13 @@ export class AuditStore {
 
     for (const date of dates) {
       const filePath = this.getFilePath(connectorId, date);
-      try {
-        const content = await fs.readFile(filePath, 'utf-8');
-        const dayEntries = JSON.parse(content) as AuditEntry[];
+      const legacyPath = this.getLegacyFilePath(connectorId, date);
 
-        // Restore Date objects and filter by exact timestamp
-        for (const entry of dayEntries) {
-          entry.timestamp = new Date(entry.timestamp);
-          if (entry.timestamp >= from && entry.timestamp <= to) {
-            entries.push(entry);
-          }
+      const dayEntries = await this.readEntriesForDay(filePath, legacyPath);
+      for (const entry of dayEntries) {
+        if (entry.timestamp >= from && entry.timestamp <= to) {
+          entries.push(entry);
         }
-      } catch {
-        // File doesn't exist for this day, skip
       }
     }
 
@@ -143,16 +136,14 @@ export class AuditStore {
     const files = await fs.readdir(connectorDir);
 
     for (const file of files) {
-      if (!file.endsWith('.json')) continue;
+      if (!file.endsWith('.json') && !file.endsWith('.ndjson')) continue;
 
       const filePath = path.join(connectorDir, file);
       try {
-        const content = await fs.readFile(filePath, 'utf-8');
-        const dayEntries = JSON.parse(content) as AuditEntry[];
-
-        for (const entry of dayEntries) {
-          entry.timestamp = new Date(entry.timestamp);
-          entries.push(entry);
+        if (file.endsWith('.ndjson')) {
+          entries.push(...(await this.readNdjsonFile(filePath)));
+        } else {
+          entries.push(...(await this.readLegacyJsonFile(filePath)));
         }
       } catch {
         // Skip invalid files
@@ -208,8 +199,8 @@ export class AuditStore {
       const files = await fs.readdir(connectorDir);
 
       for (const file of files) {
-        if (!file.endsWith('.json')) continue;
-        const fileDate = file.replace('.json', '');
+        if (!file.endsWith('.json') && !file.endsWith('.ndjson')) continue;
+        const fileDate = file.replace(/\.ndjson$|\.json$/, '');
 
         if (fileDate < cutoffStr) {
           await fs.unlink(path.join(connectorDir, file));
@@ -238,5 +229,62 @@ export class AuditStore {
     }
 
     return dates;
+  }
+
+  private enqueueWrite(filePath: string, op: () => Promise<void>): Promise<void> {
+    const previous = AuditStore.writeQueue.get(filePath) ?? Promise.resolve();
+    const next = previous.then(op, op);
+    let wrapped: Promise<void>;
+    wrapped = next.finally(() => {
+      if (AuditStore.writeQueue.get(filePath) === wrapped) {
+        AuditStore.writeQueue.delete(filePath);
+      }
+    });
+    AuditStore.writeQueue.set(filePath, wrapped);
+    return wrapped;
+  }
+
+  private async readEntriesForDay(
+    ndjsonPath: string,
+    legacyJsonPath: string
+  ): Promise<AuditEntry[]> {
+    const [ndjsonEntries, legacyEntries] = await Promise.all([
+      this.readNdjsonFile(ndjsonPath),
+      this.readLegacyJsonFile(legacyJsonPath),
+    ]);
+    return [...legacyEntries, ...ndjsonEntries];
+  }
+
+  private async readNdjsonFile(filePath: string): Promise<AuditEntry[]> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const lines = content.split('\n').filter((line) => line.trim().length > 0);
+      const entries: AuditEntry[] = [];
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line) as AuditEntry;
+          entry.timestamp = new Date(entry.timestamp);
+          entries.push(entry);
+        } catch {
+          // Skip invalid lines
+        }
+      }
+      return entries;
+    } catch {
+      return [];
+    }
+  }
+
+  private async readLegacyJsonFile(filePath: string): Promise<AuditEntry[]> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const dayEntries = JSON.parse(content) as AuditEntry[];
+      for (const entry of dayEntries) {
+        entry.timestamp = new Date(entry.timestamp);
+      }
+      return dayEntries;
+    } catch {
+      return [];
+    }
   }
 }

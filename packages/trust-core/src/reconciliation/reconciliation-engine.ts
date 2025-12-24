@@ -6,6 +6,7 @@
 
 import { randomUUID } from 'crypto';
 import type { IConnector, Record as DataRecord } from '@datatrust/core';
+import { createBlockingKey } from '@datatrust/entity-resolution/blocking';
 import type { IReconciliationEngine } from '../interfaces/index.js';
 import type {
   ReconciliationReport,
@@ -57,6 +58,7 @@ export class ReconciliationEngine implements IReconciliationEngine {
       targetKeyField = 'id',
       minConfidence = 50,
       maxRecords,
+      blocking,
     } = options;
 
     // Load records
@@ -73,7 +75,8 @@ export class ReconciliationEngine implements IReconciliationEngine {
       rules,
       sourceKeyField,
       targetKeyField,
-      minConfidence
+      minConfidence,
+      blocking
     );
 
     // Calculate summary
@@ -123,7 +126,8 @@ export class ReconciliationEngine implements IReconciliationEngine {
     rules: ReconciliationOptions['rules'],
     sourceKeyField: string,
     targetKeyField: string,
-    minConfidence: number
+    minConfidence: number,
+    blocking?: ReconciliationOptions['blocking']
   ): {
     matched: MatchResult[];
     unmatchedSource: UnmatchedRecord[];
@@ -132,12 +136,118 @@ export class ReconciliationEngine implements IReconciliationEngine {
     const matched: MatchResult[] = [];
     const matchedTargetKeys = new Set<string>();
 
+    const blockingMode = blocking?.mode ?? 'auto';
+    const maxKeyLength = 256;
+    const separator = '\u001F';
+
+    type BlockingFieldPair = {
+      sourceField: string;
+      targetField: string;
+      caseSensitive: boolean;
+    };
+
+    const requiredEqualsRules: BlockingFieldPair[] =
+      blockingMode === 'auto'
+        ? rules
+            .filter((r) => r.required === true && r.operator === 'equals')
+            .map((r) => ({
+              sourceField: r.sourceField,
+              targetField: r.targetField,
+              caseSensitive: r.options?.caseSensitive ?? true,
+            }))
+        : [];
+
+    const canAutoBlock = requiredEqualsRules.length > 0;
+    const configuredSourceField =
+      blockingMode === 'configured' ? blocking?.sourceField : undefined;
+    const configuredTargetField =
+      blockingMode === 'configured' ? blocking?.targetField : undefined;
+    const configuredAlgorithm = blocking?.algorithm ?? 'exact';
+    const configuredPrefixLength = blocking?.prefixLength;
+
+    const buildCompositeKey = (
+      record: DataRecord,
+      pairs: BlockingFieldPair[],
+      side: 'source' | 'target'
+    ): string | null => {
+      const parts: string[] = [];
+      for (const pair of pairs) {
+        const field = side === 'source' ? pair.sourceField : pair.targetField;
+        const key = createBlockingKey(record[field], 'exact', {
+          caseSensitive: pair.caseSensitive,
+          maxLength: maxKeyLength,
+        });
+        if (!key) return null;
+        parts.push(key);
+      }
+      return parts.join(separator);
+    };
+
+    const buildConfiguredKey = (
+      record: DataRecord,
+      field: string
+    ): string | null =>
+      createBlockingKey(record[field], configuredAlgorithm, {
+        caseSensitive: false,
+        maxLength: maxKeyLength,
+        prefixLength: configuredPrefixLength,
+      });
+
+    let targetIndex: Map<string, DataRecord[]> | null = null;
+    if (blockingMode === 'auto' && canAutoBlock) {
+      targetIndex = new Map<string, DataRecord[]>();
+      for (const targetRecord of targetRecords) {
+        const key = buildCompositeKey(targetRecord, requiredEqualsRules, 'target');
+        if (!key) continue;
+        const bucket = targetIndex.get(key);
+        if (bucket) bucket.push(targetRecord);
+        else targetIndex.set(key, [targetRecord]);
+      }
+    } else if (
+      blockingMode === 'configured' &&
+      configuredSourceField &&
+      configuredTargetField
+    ) {
+      targetIndex = new Map<string, DataRecord[]>();
+      for (const targetRecord of targetRecords) {
+        const key = buildConfiguredKey(targetRecord, configuredTargetField);
+        if (!key) continue;
+        const bucket = targetIndex.get(key);
+        if (bucket) bucket.push(targetRecord);
+        else targetIndex.set(key, [targetRecord]);
+      }
+    }
+
+    const getCandidates = (sourceRecord: DataRecord): DataRecord[] => {
+      if (blockingMode === 'off') return targetRecords;
+
+      if (blockingMode === 'auto' && canAutoBlock) {
+        const key = buildCompositeKey(sourceRecord, requiredEqualsRules, 'source');
+        if (!key) return [];
+        return targetIndex?.get(key) ?? [];
+      }
+
+      if (
+        blockingMode === 'configured' &&
+        configuredSourceField &&
+        configuredTargetField
+      ) {
+        const key = buildConfiguredKey(sourceRecord, configuredSourceField);
+        if (!key) return targetRecords;
+        const candidates = targetIndex?.get(key);
+        return candidates && candidates.length > 0 ? candidates : targetRecords;
+      }
+
+      return targetRecords;
+    };
+
     // For each source record, find the best matching target
     for (const sourceRecord of sourceRecords) {
       const sourceKey = this.extractKey(sourceRecord, sourceKeyField);
       let bestMatch: { targetRecord: DataRecord; confidence: number; matchedRules: string[]; failedRules: string[] } | null = null;
 
-      for (const targetRecord of targetRecords) {
+      const candidates = getCandidates(sourceRecord);
+      for (const targetRecord of candidates) {
         const targetKey = this.extractKey(targetRecord, targetKeyField);
 
         // Skip already matched targets
@@ -251,6 +361,26 @@ export class ReconciliationEngine implements IReconciliationEngine {
           code: 'INVALID_RULE',
           message: `Rule '${rule.name}' has invalid weight: ${rule.weight}. Must be 1-100`,
         });
+      }
+    }
+
+    if (options.blocking?.mode === 'configured') {
+      if (!options.blocking.sourceField || !options.blocking.targetField) {
+        throw new TrustError({
+          code: 'INVALID_OPTIONS',
+          message: 'Blocking mode "configured" requires sourceField and targetField',
+          context: { blocking: options.blocking },
+        });
+      }
+      if (options.blocking.algorithm === 'prefix') {
+        const n = options.blocking.prefixLength ?? 4;
+        if (!Number.isInteger(n) || n < 1 || n > 32) {
+          throw new TrustError({
+            code: 'INVALID_OPTIONS',
+            message: `blocking.prefixLength must be an integer between 1 and 32 (got ${n})`,
+            context: { blocking: options.blocking },
+          });
+        }
       }
     }
   }

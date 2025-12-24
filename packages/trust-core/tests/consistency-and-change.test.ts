@@ -236,7 +236,7 @@ describe('ReconciliationEngine', () => {
     expect(report.matched[0]?.confidence).toBeCloseTo(50, 5);
   });
 
-  it('handles zero and negative amounts with tolerance', async () => {
+  it('handles zero and negative amounts with tolerance', async () => {    
     const engine = new ReconciliationEngine();
     const source = new InMemoryConnector('src', 'src', 'memory', [
       { id: 'A', amount: 0 },
@@ -251,6 +251,111 @@ describe('ReconciliationEngine', () => {
 
     expect(report.matched).toHaveLength(2);
     expect(report.summary.averageConfidence).toBe(100);
+  });
+
+  it('matches using similarity operator (levenshtein)', async () => {
+    const engine = new ReconciliationEngine();
+    const source = new InMemoryConnector('src', 'src', 'memory', [
+      { id: 'A', reference: 'INV-12345' },
+    ]);
+    const target = new InMemoryConnector('tgt', 'tgt', 'memory', [
+      { id: 'B', reference: 'INV-12346' },
+    ]);
+
+    const similarityRules = [
+      {
+        name: 'reference_fuzzy',
+        sourceField: 'reference',
+        targetField: 'reference',
+        operator: 'similarity' as const,
+        weight: 100,
+        required: true,
+        options: {
+          similarityAlgorithm: 'levenshtein' as const,
+          similarityThreshold: 0.85,
+        },
+      },
+    ];
+
+    const report = await engine.reconcile(source, target, {
+      rules: similarityRules,
+      minConfidence: 0,
+    });
+
+    expect(report.matched).toHaveLength(1);
+    expect(report.matched[0]?.confidence).toBe(100);
+  });
+
+  it('matches using similarity operator (soundex)', async () => {
+    const engine = new ReconciliationEngine();
+    const source = new InMemoryConnector('src', 'src', 'memory', [
+      { id: 'A', name: 'Robert' },
+    ]);
+    const target = new InMemoryConnector('tgt', 'tgt', 'memory', [
+      { id: 'B', name: 'Rupert' },
+    ]);
+
+    const similarityRules = [
+      {
+        name: 'name_phonetic',
+        sourceField: 'name',
+        targetField: 'name',
+        operator: 'similarity' as const,
+        weight: 100,
+        required: true,
+        options: {
+          similarityAlgorithm: 'soundex' as const,
+          similarityThreshold: 1,
+        },
+      },
+    ];
+
+    const report = await engine.reconcile(source, target, {
+      rules: similarityRules,
+      minConfidence: 0,
+    });
+
+    expect(report.matched).toHaveLength(1);
+    expect(report.matched[0]?.confidence).toBe(100);
+  });
+
+  it('supports configured blocking for large datasets', async () => {
+    const engine = new ReconciliationEngine();
+    const source = new InMemoryConnector('src', 'src', 'memory', [
+      { id: 'A', reference: 'INV-12345', amount: 10 },
+      { id: 'B', reference: 'INV-99999', amount: 20 },
+    ]);
+    const target = new InMemoryConnector('tgt', 'tgt', 'memory', [
+      { id: 'X', reference: 'INV-12345', amount: 10 },
+      { id: 'Y', reference: 'INV-99999', amount: 20 },
+    ]);
+
+    const blockingRules = [
+      {
+        name: 'reference',
+        sourceField: 'reference',
+        targetField: 'reference',
+        operator: 'equals' as const,
+        weight: 100,
+        required: true,
+      },
+    ];
+
+    const report = await engine.reconcile(source, target, {
+      rules: blockingRules,
+      minConfidence: 0,
+      blocking: {
+        mode: 'configured',
+        sourceField: 'reference',
+        targetField: 'reference',
+        algorithm: 'prefix',
+        prefixLength: 4,
+      },
+    });
+
+    expect(report.matched).toHaveLength(2);
+    expect(report.summary.unmatchedSourceCount).toBe(0);
+    expect(report.summary.unmatchedTargetCount).toBe(0);
   });
 });
 

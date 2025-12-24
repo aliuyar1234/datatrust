@@ -25,6 +25,15 @@ pnpm-debug.log*
 .env.local
 .env.*.local
 
+# Internal tooling / AI assistants
+.claude/
+CLAUDE.md
+
+# Runtime data / local state
+.audit-logs/
+.snapshots/
+.policy-audit/
+
 # Test coverage
 coverage/
 

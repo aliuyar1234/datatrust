@@ -35,7 +35,7 @@
     "@datatrust/connector-api": "workspace:*",
     "@datatrust/connector-db": "workspace:*",
     "@datatrust/trust-core": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.24.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {

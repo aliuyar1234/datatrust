@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "datatrust.config.schema.json",
+  "title": "DataTrust MCP Server config.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional JSON Schema reference (editor support)"
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "transport": { "type": "string", "enum": ["stdio", "http"] },
+        "http": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "host": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "path": { "type": "string", "default": "/mcp" },
+            "metricsPath": { "type": "string", "default": "/metrics" },
+            "healthPath": { "type": "string", "default": "/healthz" },
+            "bearerTokenEnv": { "type": "string" }
+          }
+        },
+        "logging": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "format": { "type": "string", "enum": ["text", "json"] },
+            "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] }
+          }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "defaultAction": { "type": "string", "enum": ["allow", "deny"] },
+            "allowTools": { "type": "array", "items": { "type": "string" } },
+            "denyTools": { "type": "array", "items": { "type": "string" } },
+            "allowConnectors": { "type": "array", "items": { "type": "string" } },
+            "denyConnectors": { "type": "array", "items": { "type": "string" } },
+            "masking": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": { "type": "string", "enum": ["redact"] },
+                "replacement": { "type": "string" },
+                "fields": { "type": "array", "items": { "type": "string" } },
+                "perConnector": {
+                  "type": "object",
+                  "additionalProperties": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            },
+            "writes": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": { "type": "string", "enum": ["allow", "deny", "require_approval"] },
+                "approvalTokenEnv": { "type": "string" }
+              }
+            },
+            "audit": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "logDir": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "connectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "title": "CSV connector",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "const": "csv" },
+              "filePath": { "type": "string" },
+              "readonly": { "type": "boolean" },
+              "primaryKey": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+              "encoding": { "type": "string" },
+              "delimiter": { "type": "string" },
+              "headers": { "type": "boolean" },
+              "sanitizeFormulas": { "type": "boolean", "default": true },
+              "formulaEscapePrefix": { "type": "string", "default": "'" }
+            },
+            "required": ["id", "type", "filePath"]
+          },
+          {
+            "title": "JSON connector",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "const": "json" },
+              "filePath": { "type": "string" },
+              "readonly": { "type": "boolean" },
+              "primaryKey": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+              "encoding": { "type": "string" },
+              "recordsPath": { "type": "string" },
+              "prettyPrint": { "type": "boolean", "default": true },
+              "indent": { "type": "integer", "minimum": 0, "maximum": 16, "default": 2 }
+            },
+            "required": ["id", "type", "filePath"]
+          },
+          {
+            "title": "Excel connector",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "const": "excel" },
+              "filePath": { "type": "string" },
+              "readonly": { "type": "boolean" },
+              "primaryKey": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+              "encoding": { "type": "string" },
+              "sheet": { "oneOf": [{ "type": "string" }, { "type": "integer", "minimum": 1 }] },
+              "headers": { "type": "boolean" },
+              "startRow": { "type": "integer", "minimum": 1 },
+              "startColumn": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["id", "type", "filePath"]
+          },
+          {
+            "title": "Odoo connector",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "const": "odoo" },
+              "url": { "type": "string" },
+              "database": { "type": "string" },
+              "username": { "type": "string" },
+              "password": { "type": "string" },
+              "model": { "type": "string" },
+              "readonly": { "type": "boolean" },
+              "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 300000 }
+            },
+            "required": ["id", "type", "url", "database", "username", "password", "model"]
+          },
+          {
+            "title": "HubSpot connector",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "const": "hubspot" },
+              "accessToken": { "type": "string" },
+              "apiKey": { "type": "string", "deprecated": true },
+              "objectType": { "type": "string", "enum": ["contacts", "companies", "deals", "tickets"] },
+              "readonly": { "type": "boolean" },
+              "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 300000 }
+            },
+            "required": ["id", "type", "objectType"]
+          },
+          {
+            "title": "PostgreSQL connector",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "const": "postgresql" },
+              "connectionString": { "type": "string" },
+              "host": { "type": "string" },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "database": { "type": "string" },
+              "user": { "type": "string" },
+              "password": { "type": "string" },
+              "ssl": { "oneOf": [{ "type": "boolean" }, { "type": "object", "additionalProperties": false, "properties": { "rejectUnauthorized": { "type": "boolean" } } }] },
+              "schema": { "type": "string" },
+              "table": { "type": "string" },
+              "primaryKey": { "type": "string" },
+              "readonly": { "type": "boolean" }
+            },
+            "required": ["id", "type", "table"]
+          },
+          {
+            "title": "MySQL connector",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "const": "mysql" },
+              "uri": { "type": "string" },
+              "host": { "type": "string" },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "database": { "type": "string" },
+              "user": { "type": "string" },
+              "password": { "type": "string" },
+              "ssl": { "oneOf": [{ "type": "boolean" }, { "type": "object", "additionalProperties": false, "properties": { "rejectUnauthorized": { "type": "boolean" } } }] },
+              "table": { "type": "string" },
+              "primaryKey": { "type": "string" },
+              "readonly": { "type": "boolean" }
+            },
+            "required": ["id", "type", "table"]
+          }
+        ]
+      }
+    }
+  },
+  "required": ["connectors"]
+}

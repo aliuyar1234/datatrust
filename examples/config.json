@@ -1,4 +1,5 @@
 {
+  "$schema": "../schemas/datatrust.config.schema.json",
   "server": {
     "name": "mcp-enterprise-connectors",
     "version": "0.1.0"

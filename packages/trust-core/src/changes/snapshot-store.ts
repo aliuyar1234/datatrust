@@ -32,11 +32,11 @@ export class SnapshotStore {
    */
   private async ensureDir(): Promise<void> {
     try {
-      await fs.mkdir(this.baseDir, { recursive: true });
+      await fs.mkdir(this.baseDir, { recursive: true, mode: 0o700 });
     } catch (err) {
       throw new TrustError({
         code: 'SNAPSHOT_ERROR',
-        message: `Failed to create snapshot directory: ${this.baseDir}`,
+        message: `Failed to create snapshot directory: ${this.baseDir}`,        
         cause: err instanceof Error ? err : undefined,
       });
     }
@@ -55,19 +55,6 @@ export class SnapshotStore {
 
     const filePath = this.getFilePath(snapshotId);
 
-    // Check if snapshot already exists
-    try {
-      await fs.access(filePath);
-      throw new TrustError({
-        code: 'SNAPSHOT_EXISTS',
-        message: `Snapshot '${snapshotId}' already exists`,
-        context: { snapshotId, filePath },
-      });
-    } catch (err) {
-      // File doesn't exist, which is what we want
-      if (err instanceof TrustError) throw err;
-    }
-
     const meta: SnapshotInfo = {
       id: snapshotId,
       connectorId,
@@ -83,8 +70,19 @@ export class SnapshotStore {
     };
 
     try {
-      await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
+      await fs.writeFile(filePath, JSON.stringify(data, null, 2), {
+        encoding: 'utf-8',
+        flag: 'wx',
+        mode: 0o600,
+      });
     } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new TrustError({
+          code: 'SNAPSHOT_EXISTS',
+          message: `Snapshot '${snapshotId}' already exists`,
+          context: { snapshotId, filePath },
+        });
+      }
       throw new TrustError({
         code: 'SNAPSHOT_ERROR',
         message: `Failed to save snapshot '${snapshotId}'`,

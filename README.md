@@ -4,7 +4,7 @@ LLM-gesteuerte Datenintegration über das Model Context Protocol.
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)
 ![License](https://img.shields.io/badge/License-BSL%201.1-blue)
-![Tests](https://img.shields.io/badge/Tests-20%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-27%20passing-brightgreen)
 
 ## Das Problem
 
@@ -44,6 +44,7 @@ node packages/mcp-server/dist/cli.js --config config.json
 
 ```json
 {
+  "$schema": "./schemas/datatrust.config.schema.json",
   "server": { "name": "my-connectors", "version": "1.0.0" },
   "connectors": [
     {
@@ -54,12 +55,17 @@ node packages/mcp-server/dist/cli.js --config config.json
     {
       "id": "customers",
       "type": "hubspot",
-      "apiKey": "${HUBSPOT_API_KEY}",
+      "accessToken": "${HUBSPOT_ACCESS_TOKEN}",
       "objectType": "contacts"
     }
   ]
 }
 ```
+
+**Config Features:**
+- Umgebungsvariablen in Strings werden beim Start expandiert: `${ENV_VAR}` und `${ENV_VAR:-default}` (fehlende Variablen => fail-fast).
+- Optionaler HTTP-Transport: `server.transport = "http"` (Endpoints: `/mcp`, `/healthz`, `/metrics`).
+- Optionaler Governance-Layer: `server.policy` (Tool/Connector-Allowlist, Field-Masking, Write-Approval + auditable Decisions).
 
 **Erster Befehl (im LLM):**
 
@@ -104,6 +110,7 @@ Toleranz: ±0.01€, Datum ±7 Tage.
 | `@datatrust/connector-api` | Odoo, HubSpot |
 | `@datatrust/connector-db` | PostgreSQL, MySQL |
 | `@datatrust/trust-core` | Data Trust Layer |
+| `@datatrust/entity-resolution` | Similarity / Fuzzy Matching Utilities |
 | `@datatrust/mcp-server` | MCP Server Implementation |
 
 ## Filter Syntax
@@ -126,25 +133,44 @@ Toleranz: ±0.01€, Datum ±7 Tage.
 ```json
 {
   "rules": [
-    { "name": "amount", "sourceField": "amount", "targetField": "total",
-      "operator": "equals_tolerance", "weight": 40, "options": { "tolerance": 0.01 } },
-    { "name": "reference", "sourceField": "reference", "targetField": "invoice_number",
-      "operator": "contains", "weight": 35 },
-    { "name": "date", "sourceField": "booking_date", "targetField": "due_date",
-      "operator": "date_range", "weight": 25, "options": { "dateRangeDays": 7 } }
+    {
+      "name": "amount",
+      "source_field": "amount",
+      "target_field": "total",
+      "operator": "equals_tolerance",
+      "weight": 40,
+      "tolerance": 0.01
+    },
+    {
+      "name": "reference",
+      "source_field": "reference",
+      "target_field": "invoice_number",
+      "operator": "similarity",
+      "weight": 35,
+      "similarity_algorithm": "jaro_winkler",
+      "similarity_threshold": 0.85
+    },
+    {
+      "name": "date",
+      "source_field": "booking_date",
+      "target_field": "due_date",
+      "operator": "date_range",
+      "weight": 25,
+      "date_range_days": 7
+    }
   ],
-  "minConfidence": 60
+  "min_confidence": 60
 }
 ```
 
-**Operatoren:** `equals`, `equals_tolerance`, `contains`, `regex`, `date_range`
+**Operatoren:** `equals`, `equals_tolerance`, `contains`, `regex`, `similarity`, `date_range`
 
 ## Development
 
 ```bash
 pnpm install     # Dependencies
 pnpm build       # Build all packages
-pnpm -r test     # Run tests (20 tests)
+pnpm -r test     # Run tests (27 tests)
 ```
 
 ## License

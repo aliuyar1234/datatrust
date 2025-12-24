@@ -4,17 +4,47 @@
  * Generic MCP server that exposes connector tools.
  */
 
+import { randomUUID } from 'node:crypto';
+import { createServer as createHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { ConnectorError } from '@datatrust/core';
 import { createConsistencyMonitor, createChangeDetector, createAuditLogger, createReconciliationEngine, MCPFormatter, TrustError } from '@datatrust/trust-core';
 import type { FieldMapping, KeyFieldConfig, ChangeDetectorOptions, AuditQueryOptions, AuditOperation, MatchingRule, ReconciliationOptions, RuleOperator } from '@datatrust/trust-core';
 import { registry } from './connector-registry.js';
+import type { PolicyConfig } from './config.js';
+import { Logger, createTraceId } from './logger.js';
+import { PolicyAuditStore } from './policy-audit-store.js';
+import {
+  evaluatePolicy,
+  getMaskReplacement,
+  isFieldMasked,
+  maskRecord,
+  maskRecords,
+} from './policy.js';
+import { getTraceId, runWithTelemetry } from './telemetry.js';
+import { metrics } from './metrics.js';
 
 export interface ServerConfig {
   name: string;
   version: string;
+  transport?: 'stdio' | 'http';
+  http?: {
+    host?: string;
+    port?: number;
+    path?: string;
+    metricsPath?: string;
+    healthPath?: string;
+    bearerTokenEnv?: string;
+  };
+  policy?: PolicyConfig;
+  logging?: {
+    format?: 'text' | 'json';
+    level?: 'debug' | 'info' | 'warn' | 'error';
+  };
+  logger?: Logger;
 }
 
 /** Helper to create a text content item */
@@ -22,17 +52,35 @@ function textContent(text: string) {
   return { type: 'text' as const, text };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
 /** Helper to create a success result */
 function success(data: unknown) {
+  const traceId = getTraceId();
+  const payload =
+    traceId && isPlainObject(data)
+      ? { trace_id: traceId, ...data }
+      : traceId
+        ? { trace_id: traceId, data }
+        : data;
   return {
-    content: [textContent(JSON.stringify(data, null, 2))],
+    content: [textContent(JSON.stringify(payload, null, 2))],
   };
 }
 
 /** Helper to create an error result */
 function error(message: string) {
+  const traceId = getTraceId();
+  const output = traceId ? `${message}\ntrace_id: ${traceId}` : message;
   return {
-    content: [textContent(message)],
+    content: [textContent(output)],
     isError: true,
   };
 }
@@ -48,6 +96,46 @@ function formatError(err: unknown) {
           ? err.message
           : String(err);
   return error(message);
+}
+
+const FORBIDDEN_RECORD_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+const recordSchema = z
+  .record(z.unknown())
+  .refine((record) => !Array.isArray(record), {
+    message: 'Record must be an object',
+  })
+  .superRefine((record, ctx) => {
+    for (const key of Object.keys(record)) {
+      if (FORBIDDEN_RECORD_KEYS.has(key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Unsafe record key: ${key}`,
+        });
+      }
+    }
+  });
+
+const SCHEMA_BACKED_CONNECTOR_TYPES = new Set([
+  'postgresql',
+  'mysql',
+  'odoo',
+  'hubspot',
+]);
+
+function findUnknownField(
+  records: Array<Record<string, unknown>>,
+  allowedFields: Set<string>
+): { index: number; field: string } | null {
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]!;
+    for (const field of Object.keys(record)) {
+      if (!allowedFields.has(field)) {
+        return { index: i, field };
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -81,8 +169,165 @@ export async function createServer(config: ServerConfig): Promise<McpServer> {
     version: config.version,
   });
 
+  const logger =
+    config.logger ??
+    new Logger({
+      level: config.logging?.level,
+      format: config.logging?.format,
+    });
+  const policy = config.policy;
+  const policyAudit =
+    policy?.audit?.enabled === true
+      ? new PolicyAuditStore(policy.audit.logDir ?? './.policy-audit')
+      : null;
+
+  const summarizeToolArgs = (tool: string, args: unknown): Record<string, unknown> => {
+    const obj = typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {};
+    if (tool === 'write_records') {
+      const records = Array.isArray(obj['records']) ? (obj['records'] as unknown[]) : [];
+      return {
+        connector_id: obj['connector_id'],
+        mode: obj['mode'],
+        record_count: records.length,
+      };
+    }
+    if (tool === 'read_records') {
+      return {
+        connector_id: obj['connector_id'],
+        where_count: Array.isArray(obj['where']) ? (obj['where'] as unknown[]).length : 0,
+        select_count: Array.isArray(obj['select']) ? (obj['select'] as unknown[]).length : 0,
+        limit: obj['limit'],
+        offset: obj['offset'],
+      };
+    }
+    if (tool === 'compare_records') {
+      return {
+        source_connector_id: obj['source_connector_id'],
+        target_connector_id: obj['target_connector_id'],
+        mapping_count: Array.isArray(obj['field_mappings'])
+          ? (obj['field_mappings'] as unknown[]).length
+          : 0,
+        max_records: obj['max_records'],
+      };
+    }
+    if (tool === 'reconcile_records') {
+      return {
+        source_connector_id: obj['source_connector_id'],
+        target_connector_id: obj['target_connector_id'],
+        rule_count: Array.isArray(obj['rules']) ? (obj['rules'] as unknown[]).length : 0,
+        min_confidence: obj['min_confidence'],
+        max_records: obj['max_records'],
+      };
+    }
+    if (tool === 'detect_changes') {
+      return {
+        connector_id: obj['connector_id'],
+        snapshot_id: obj['snapshot_id'],
+        since: obj['since'],
+        include_records: obj['include_records'],
+        max_records: obj['max_records'],
+      };
+    }
+    if (tool === 'create_snapshot') {
+      return {
+        connector_id: obj['connector_id'],
+        snapshot_id: obj['snapshot_id'],
+      };
+    }
+    if (tool === 'query_audit_log') {
+      return {
+        connector_id: obj['connector_id'],
+        operation: obj['operation'],
+        record_key: obj['record_key'],
+        user: obj['user'],
+        from: obj['from'],
+        to: obj['to'],
+        limit: obj['limit'],
+      };
+    }
+    return {};
+  };
+
+  const registerTool = (
+    toolName: string,
+    definition: any,
+    handler: (args: any) => Promise<any>,
+    connectorsFromArgs: (args: any) => string[] = () => []
+  ) => {
+    server.registerTool(toolName, definition, async (args: any) => {
+      const connectors = connectorsFromArgs(args);
+      const traceId = createTraceId();
+
+      return runWithTelemetry({ traceId, tool: toolName, connectors }, async () => {
+        const approvalToken =
+          toolName === 'write_records' ? (args?.approval_token as string | undefined) : undefined;
+        const decision = evaluatePolicy(policy, {
+          tool: toolName,
+          connectors,
+          approvalToken,
+        });
+
+        if (policyAudit) {
+          try {
+            await policyAudit.append({
+              id: randomUUID(),
+              timestamp: new Date(),
+              traceId,
+              decision: decision.allowed ? 'allow' : 'deny',
+              tool: toolName,
+              connectors,
+              reason: decision.reason,
+              request: summarizeToolArgs(toolName, args),
+            });
+          } catch (err) {
+            logger.warn('Failed to write policy audit entry', { traceId, tool: toolName, error: err });
+          }
+        }
+
+        if (!decision.allowed) {
+          logger.warn('Policy denied tool invocation', {
+            traceId,
+            tool: toolName,
+            connectors,
+            reason: decision.reason,
+          });
+          metrics.incTool(toolName, 'denied');
+          return error(`Denied by policy: ${decision.reason}`);
+        }
+
+        const start = Date.now();
+        try {
+          const result = await handler(args);
+          const durationMs = Date.now() - start;
+          metrics.observeToolDuration(toolName, durationMs);
+          metrics.incTool(toolName, result?.isError ? 'error' : 'success');
+          logger.info('Tool invocation completed', {
+            traceId,
+            tool: toolName,
+            connectors,
+            durationMs,
+            outcome: result?.isError ? 'error' : 'success',
+          });
+          return result;
+        } catch (err) {
+          const durationMs = Date.now() - start;
+          metrics.observeToolDuration(toolName, durationMs);
+          metrics.incTool(toolName, 'error');
+          logger.error('Tool invocation failed', {
+            traceId,
+            tool: toolName,
+            connectors,
+            durationMs,
+            error: err,
+          });
+          return formatError(err);
+        }
+      });
+    });
+  };
+
   // Tool: list_connectors
-  server.registerTool(
+  registerTool(
     'list_connectors',
     {
       description:
@@ -92,11 +337,12 @@ export async function createServer(config: ServerConfig): Promise<McpServer> {
     async () => {
       const connectors = registry.list();
       return success({ connectors, count: connectors.length });
-    }
+    },
+    () => []
   );
 
   // Tool: get_schema
-  server.registerTool(
+  registerTool(
     'get_schema',
     {
       description:
@@ -122,11 +368,12 @@ export async function createServer(config: ServerConfig): Promise<McpServer> {
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.connector_id]
   );
 
   // Tool: read_records
-  server.registerTool(
+  registerTool(
     'read_records',
     {
       description: `Read records from a data connector with optional filtering and pagination.
@@ -160,8 +407,14 @@ Example: {"where": [{"field": "amount", "op": "gt", "value": 1000}], "limit": 10
           )
           .optional()
           .describe('Sort order'),
-        offset: z.number().optional().describe('Records to skip'),
-        limit: z.number().optional().describe('Max records to return'),
+        offset: z.number().int().min(0).optional().describe('Records to skip'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(10000)
+          .optional()
+          .describe('Max records to return (max: 10000)'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -174,7 +427,12 @@ Example: {"where": [{"field": "amount", "op": "gt", "value": 1000}], "limit": 10
         }
 
         const filter = {
-          where: args.where?.map((w) => ({ ...w, value: w.value })),
+          where: args.where?.map(
+            (w: { field: string; op: string; value: unknown }) => ({
+              ...w,
+              value: w.value,
+            })
+          ),
           select: args.select,
           orderBy: args.orderBy,
           offset: args.offset,
@@ -182,15 +440,23 @@ Example: {"where": [{"field": "amount", "op": "gt", "value": 1000}], "limit": 10
         };
 
         const result = await connector.readRecords(filter);
-        return success({ connector_id: args.connector_id, ...result });
+        const records = Array.isArray(result.records)
+          ? maskRecords(
+              result.records as Array<Record<string, unknown>>,
+              args.connector_id,
+              policy
+            )
+          : result.records;
+        return success({ connector_id: args.connector_id, ...result, records });
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.connector_id]
   );
 
   // Tool: write_records
-  server.registerTool(
+  registerTool(
     'write_records',
     {
       description: `Write records to a data connector.
@@ -200,7 +466,17 @@ Modes: insert (new only), update (existing), upsert (both - default)
 Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount": 1500}]}`,
       inputSchema: {
         connector_id: z.string().describe('The ID of the connector'),
-        records: z.array(z.record(z.unknown())).describe('Records to write'),
+        records: z
+          .array(recordSchema)
+          .min(1)
+          .max(1000)
+          .describe('Records to write (max: 1000)'),
+        approval_token: z
+          .string()
+          .optional()
+          .describe(
+            'Optional write approval token. If policy.writes.mode=require_approval, this must match the server env var configured by policy.writes.approvalTokenEnv (default: DATATRUST_WRITE_TOKEN).'
+          ),
         mode: z
           .enum(['insert', 'update', 'upsert'])
           .optional()
@@ -220,6 +496,40 @@ Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount":
           return error(`Connector '${args.connector_id}' is read-only`);
         }
 
+        if (SCHEMA_BACKED_CONNECTOR_TYPES.has(connector.config.type)) {
+          const schema = await connector.getSchema(false);
+          const allowedFields = new Set(schema.fields.map((f) => f.name));
+          const unknown = findUnknownField(args.records, allowedFields);
+          if (unknown) {
+            return error(
+              `Unknown field '${unknown.field}' in record index ${unknown.index}. Call get_schema to see valid fields.`
+            );
+          }
+        }
+
+        const validation = await connector.validateRecords(args.records);
+        const invalid = validation
+          .map((result, index) => ({ ...result, index }))
+          .filter((result) => !result.valid);
+        if (invalid.length > 0) {
+          return {
+            content: [
+              textContent(
+                JSON.stringify(
+                  {
+                    message: 'Validation failed; no records were written.',
+                    invalidCount: invalid.length,
+                    invalid: invalid.slice(0, 20),
+                  },
+                  null,
+                  2
+                )
+              ),
+            ],
+            isError: true,
+          };
+        }
+
         const result = await connector.writeRecords(
           args.records,
           args.mode ?? 'upsert'
@@ -228,18 +538,23 @@ Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount":
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.connector_id]
   );
 
   // Tool: validate_records
-  server.registerTool(
+  registerTool(
     'validate_records',
     {
       description:
         'Validate records against a connector schema without writing. Use before write_records to check data.',
       inputSchema: {
         connector_id: z.string().describe('The ID of the connector'),
-        records: z.array(z.record(z.unknown())).describe('Records to validate'),
+        records: z
+          .array(recordSchema)
+          .min(1)
+          .max(1000)
+          .describe('Records to validate (max: 1000)'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -251,9 +566,20 @@ Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount":
           return error(`Connector '${args.connector_id}' is not connected`);
         }
 
-        const results = await connector.validateRecords(args.records);
+        if (SCHEMA_BACKED_CONNECTOR_TYPES.has(connector.config.type)) {
+          const schema = await connector.getSchema(false);
+          const allowedFields = new Set(schema.fields.map((f) => f.name));
+          const unknown = findUnknownField(args.records, allowedFields);
+          if (unknown) {
+            return error(
+              `Unknown field '${unknown.field}' in record index ${unknown.index}. Call get_schema to see valid fields.`
+            );
+          }
+        }
+
+        const results = await connector.validateRecords(args.records);    
         const validCount = results.filter((r) => r.valid).length;
-        const invalidCount = results.filter((r) => !r.valid).length;
+        const invalidCount = results.filter((r) => !r.valid).length;      
 
         return success({
           connector_id: args.connector_id,
@@ -263,11 +589,12 @@ Example: {"connector_id": "invoices", "records": [{"customer": "ACME", "amount":
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.connector_id]
   );
 
   // Tool: compare_records
-  server.registerTool(
+  registerTool(
     'compare_records',
     {
       description: `Compare records between two connectors to find inconsistencies.
@@ -303,7 +630,13 @@ Returns: Summary of matches, differences, and missing records with field-level d
           .boolean()
           .optional()
           .describe('Only return records with differences (default: true)'),
-        max_records: z.number().optional().describe('Max records to compare'),
+        max_records: z
+          .number()
+          .int()
+          .min(1)
+          .max(10000)
+          .optional()
+          .describe('Max records to compare (max: 10000)'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -322,11 +655,19 @@ Returns: Summary of matches, differences, and missing records with field-level d
         const monitor = createConsistencyMonitor();
         const formatter = new MCPFormatter();
 
-        const fieldMappings: FieldMapping[] = args.field_mappings.map((m) => ({
+        const fieldMappings: FieldMapping[] = args.field_mappings.map(
+          (
+            m: {
+              source: string;
+              target: string;
+              transform?: 'lowercase' | 'uppercase' | 'trim' | 'normalizeWhitespace';
+            }
+          ) => ({
           source: m.source,
           target: m.target,
           transform: m.transform,
-        }));
+        })
+        );
 
         const keyFields: KeyFieldConfig | undefined = args.key_fields
           ? {
@@ -344,16 +685,44 @@ Returns: Summary of matches, differences, and missing records with field-level d
           maxRecords: args.max_records,
         });
 
-        const output = formatter.formatAsText(report);
+        const replacement = getMaskReplacement(policy);
+        const maskedReport = {
+          ...report,
+          records: report.records.map((r) => ({
+            ...r,
+            sourceRecord: r.sourceRecord
+              ? maskRecord(
+                  r.sourceRecord as Record<string, unknown>,
+                  args.source_connector_id,
+                  policy
+                )
+              : undefined,
+            targetRecord: r.targetRecord
+              ? maskRecord(
+                  r.targetRecord as Record<string, unknown>,
+                  args.target_connector_id,
+                  policy
+                )
+              : undefined,
+            differences: r.differences?.map((d) =>
+              isFieldMasked(d.field, args.source_connector_id, policy)
+                ? { ...d, sourceValue: replacement, targetValue: replacement }
+                : d
+            ),
+          })),
+        };
+
+        const output = formatter.formatAsText(maskedReport);
         return { content: [textContent(output)] };
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.source_connector_id, args.target_connector_id]
   );
 
   // Tool: detect_changes
-  server.registerTool(
+  registerTool(
     'detect_changes',
     {
       description: `Detect what changed in a connector since a specific time or snapshot.
@@ -382,7 +751,36 @@ Returns: Summary of added, modified, deleted records with details.`,
           .boolean()
           .optional()
           .describe('Include full record data in output (default: false)'),
-        max_records: z.number().optional().describe('Max records to process'),
+        max_records: z
+          .number()
+          .int()
+          .min(1)
+          .max(10000)
+          .optional()
+          .describe('Max records to process (max: 10000)'),
+        blocking_mode: z
+          .enum(['auto', 'configured', 'off'])
+          .optional()
+          .describe('Optional blocking mode to reduce candidate comparisons'),
+        blocking_source_field: z
+          .string()
+          .optional()
+          .describe('For blocking_mode=configured: source field used for blocking'),
+        blocking_target_field: z
+          .string()
+          .optional()
+          .describe('For blocking_mode=configured: target field used for blocking'),
+        blocking_algorithm: z
+          .enum(['exact', 'prefix', 'cologne_phonetic', 'soundex'])
+          .optional()
+          .describe('For blocking_mode=configured: blocking algorithm'),
+        blocking_prefix_length: z
+          .number()
+          .int()
+          .min(1)
+          .max(32)
+          .optional()
+          .describe('For blocking_algorithm=prefix: prefix length (default: 4)'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -407,16 +805,33 @@ Returns: Summary of added, modified, deleted records with details.`,
         };
 
         const report = await changeDetector.detectChanges(connector, options);
-        const output = formatter.formatChangeReport(report);
+        const maskedReport = {
+          ...report,
+          changes: report.changes.map((c) => ({
+            ...c,
+            record: c.record
+              ? maskRecord(c.record as Record<string, unknown>, args.connector_id, policy)
+              : undefined,
+            previousRecord: c.previousRecord
+              ? maskRecord(
+                  c.previousRecord as Record<string, unknown>,
+                  args.connector_id,
+                  policy
+                )
+              : undefined,
+          })),
+        };
+        const output = formatter.formatChangeReport(maskedReport);
         return { content: [textContent(output)] };
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.connector_id]
   );
 
   // Tool: create_snapshot
-  server.registerTool(
+  registerTool(
     'create_snapshot',
     {
       description: `Create a snapshot of current connector data for later change detection.
@@ -461,11 +876,12 @@ Example workflow:
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.connector_id]
   );
 
   // Tool: list_snapshots
-  server.registerTool(
+  registerTool(
     'list_snapshots',
     {
       description: 'List all available snapshots for a connector.',
@@ -491,11 +907,12 @@ Example workflow:
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.connector_id]
   );
 
   // Tool: delete_snapshot
-  server.registerTool(
+  registerTool(
     'delete_snapshot',
     {
       description: 'Delete a snapshot.',
@@ -515,11 +932,12 @@ Example workflow:
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    () => []
   );
 
   // Tool: query_audit_log
-  server.registerTool(
+  registerTool(
     'query_audit_log',
     {
       description: `Query the audit log for past operations.
@@ -540,7 +958,13 @@ Returns: List of audit entries with operation details, before/after values, and 
         user: z.string().optional().describe('Filter by user'),
         from: isoDateSchema.optional().describe('Filter from date (ISO format)'),
         to: isoDateSchema.optional().describe('Filter to date (ISO format)'),
-        limit: z.number().optional().describe('Max entries to return (default: 100)'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(1000)
+          .optional()
+          .describe('Max entries to return (default: 100, max: 1000)'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -560,16 +984,29 @@ Returns: List of audit entries with operation details, before/after values, and 
         };
 
         const report = await auditLogger.query(options);
-        const output = formatter.formatAuditReport(report);
+        const maskedReport = {
+          ...report,
+          entries: report.entries.map((e) => ({
+            ...e,
+            before: e.before
+              ? maskRecord(e.before as Record<string, unknown>, e.connectorId, policy)
+              : undefined,
+            after: e.after
+              ? maskRecord(e.after as Record<string, unknown>, e.connectorId, policy)
+              : undefined,
+          })),
+        };
+        const output = formatter.formatAuditReport(maskedReport);
         return { content: [textContent(output)] };
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => (args.connector_id ? [args.connector_id] : [])
   );
 
   // Tool: reconcile_records
-  server.registerTool(
+  registerTool(
     'reconcile_records',
     {
       description: `Match records between two connectors using configurable rules.
@@ -583,7 +1020,8 @@ Rule operators:
 - equals: Exact match
 - equals_tolerance: Numeric match within tolerance (e.g., ±0.01)
 - contains: String contains (either direction)
-- regex: Pattern match
+- regex: Pattern match (safe by default; set unsafe_regex=true for raw regex)
+- similarity: Fuzzy string match (e.g., names, references)
 - date_range: Date within ±N days
 
 Returns: Matched pairs with confidence scores, unmatched records from both sides.`,
@@ -597,20 +1035,82 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
               source_field: z.string().describe('Field name in source records'),
               target_field: z.string().describe('Field name in target records'),
               operator: z
-                .enum(['equals', 'equals_tolerance', 'contains', 'regex', 'date_range'])
+                .enum([
+                  'equals',
+                  'equals_tolerance',
+                  'contains',
+                  'regex',
+                  'similarity',
+                  'date_range',
+                ])
                 .describe('Comparison operator'),
               weight: z.number().min(1).max(100).describe('Weight for confidence (1-100)'),
               required: z.boolean().optional().describe('Must match for valid match'),
-              tolerance: z.number().optional().describe('For equals_tolerance (e.g., 0.01)'),
-              date_range_days: z.number().optional().describe('For date_range (e.g., 3 = ±3 days)'),
+              tolerance: z
+                .number()
+                .min(0)
+                .optional()
+                .describe('For equals_tolerance (e.g., 0.01)'),
+              date_range_days: z
+                .number()
+                .int()
+                .min(0)
+                .optional()
+                .describe('For date_range (e.g., 3 = ±3 days)'),
               case_sensitive: z.boolean().optional().describe('For string operators'),
+              unsafe_regex: z
+                .boolean()
+                .optional()
+                .describe('For regex: allow raw patterns (unsafe; default: false)'),
+              similarity_algorithm: z
+                .enum([
+                  'levenshtein',
+                  'jaro',
+                  'jaro_winkler',
+                  'dice_sorensen',
+                  'jaccard',
+                  'cologne_phonetic',
+                  'soundex',
+                ])
+                .optional()
+                .describe('For similarity: algorithm (default: jaro_winkler)'),
+              similarity_threshold: z
+                .number()
+                .min(0)
+                .max(1)
+                .optional()
+                .describe('For similarity: threshold 0-1 (default: 0.85)'),
+              ngram_size: z
+                .number()
+                .int()
+                .min(1)
+                .max(5)
+                .optional()
+                .describe('For similarity dice/jaccard: n-gram size (default: 2)'),
+              prefix_scale: z
+                .number()
+                .min(0)
+                .max(0.25)
+                .optional()
+                .describe('For similarity jaro_winkler: prefix scale (default: 0.1)'),
             })
           )
           .describe('Matching rules to apply'),
         source_key_field: z.string().optional().describe('Key field in source (default: "id")'),
         target_key_field: z.string().optional().describe('Key field in target (default: "id")'),
-        min_confidence: z.number().optional().describe('Minimum confidence for match (default: 50)'),
-        max_records: z.number().optional().describe('Max records to process'),
+        min_confidence: z
+          .number()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe('Minimum confidence for match (default: 50)'),
+        max_records: z
+          .number()
+          .int()
+          .min(1)
+          .max(10000)
+          .optional()
+          .describe('Max records to process (max: 10000)'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -630,7 +1130,25 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
         const formatter = new MCPFormatter();
 
         // Convert rules from input format
-        const rules: MatchingRule[] = args.rules.map((r) => ({
+        const rules: MatchingRule[] = args.rules.map(
+          (
+            r: {
+              name: string;
+              source_field: string;
+              target_field: string;
+              operator: string;
+              weight: number;
+              required?: boolean;
+              tolerance?: number;
+              date_range_days?: number;
+              case_sensitive?: boolean;
+              unsafe_regex?: boolean;
+              similarity_algorithm?: string;
+              similarity_threshold?: number;
+              ngram_size?: number;
+              prefix_scale?: number;
+            }
+          ) => ({
           name: r.name,
           sourceField: r.source_field,
           targetField: r.target_field,
@@ -641,8 +1159,14 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
             tolerance: r.tolerance,
             dateRangeDays: r.date_range_days,
             caseSensitive: r.case_sensitive,
+            unsafeRegex: r.unsafe_regex,
+            similarityAlgorithm: r.similarity_algorithm,
+            similarityThreshold: r.similarity_threshold,
+            ngramSize: r.ngram_size,
+            prefixScale: r.prefix_scale,
           },
-        }));
+        })
+        );
 
         const options: ReconciliationOptions = {
           rules,
@@ -650,6 +1174,20 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
           targetKeyField: args.target_key_field,
           minConfidence: args.min_confidence,
           maxRecords: args.max_records,
+          blocking:
+            args.blocking_mode ||
+            args.blocking_source_field ||
+            args.blocking_target_field ||
+            args.blocking_algorithm ||
+            args.blocking_prefix_length
+              ? {
+                  mode: args.blocking_mode,
+                  sourceField: args.blocking_source_field,
+                  targetField: args.blocking_target_field,
+                  algorithm: args.blocking_algorithm,
+                  prefixLength: args.blocking_prefix_length,
+                }
+              : undefined,
         };
 
         const report = await reconciliationEngine.reconcile(
@@ -657,42 +1195,173 @@ Returns: Matched pairs with confidence scores, unmatched records from both sides
           targetConnector,
           options
         );
-        const output = formatter.formatReconciliationReport(report);
+        const maskedReport = {
+          ...report,
+          matched: report.matched.map((m) => ({
+            ...m,
+            sourceRecord: maskRecord(
+              m.sourceRecord as Record<string, unknown>,
+              args.source_connector_id,
+              policy
+            ),
+            targetRecord: maskRecord(
+              m.targetRecord as Record<string, unknown>,
+              args.target_connector_id,
+              policy
+            ),
+          })),
+          unmatchedSource: report.unmatchedSource.map((u) => ({
+            ...u,
+            record: maskRecord(
+              u.record as Record<string, unknown>,
+              args.source_connector_id,
+              policy
+            ),
+          })),
+          unmatchedTarget: report.unmatchedTarget.map((u) => ({
+            ...u,
+            record: maskRecord(
+              u.record as Record<string, unknown>,
+              args.target_connector_id,
+              policy
+            ),
+          })),
+        };
+        const output = formatter.formatReconciliationReport(maskedReport);
         return { content: [textContent(output)] };
       } catch (err) {
         return formatError(err);
       }
-    }
+    },
+    (args) => [args.source_connector_id, args.target_connector_id]
   );
 
   return server;
 }
 
 /**
- * Run the server with stdio transport
+ * Run the server with configured transport
  */
 export async function runServer(config: ServerConfig): Promise<void> {
-  const server = await createServer(config);
+  const logger =
+    config.logger ??
+    new Logger({
+      level: config.logging?.level,
+      format: config.logging?.format,
+    });
+  const server = await createServer({ ...config, logger });
+
+  const mode = config.transport ?? 'stdio';
+
+  const shutdown = async (signal: string, httpServer?: import('node:http').Server) => {
+    try {
+      if (httpServer) {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      }
+      await registry.disconnectAll();
+      await server.close();
+      logger.info('Shutdown complete', { signal });
+    } finally {
+      process.exit(0);
+    }
+  };
+
+  if (mode === 'http') {
+    const host = config.http?.host ?? '127.0.0.1';
+    const port = config.http?.port ?? 3333;
+    const mcpPath = config.http?.path ?? '/mcp';
+    const metricsPath = config.http?.metricsPath ?? '/metrics';
+    const healthPath = config.http?.healthPath ?? '/healthz';
+
+    const bearerTokenEnv = config.http?.bearerTokenEnv;
+    const bearerToken = bearerTokenEnv ? process.env[bearerTokenEnv] : undefined;
+    if (bearerTokenEnv && !bearerToken) {
+      throw new Error(`server.http.bearerTokenEnv is set to '${bearerTokenEnv}' but the env var is not set`);
+    }
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+    });
+
+    await server.connect(transport);
+
+    const httpServer = createHttpServer(async (req, res) => {
+      const sendText = (status: number, body: string, headers?: Record<string, string>) => {
+        res.writeHead(status, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff',
+          ...(headers ?? {}),
+        });
+        res.end(body);
+      };
+
+      const url = new URL(req.url ?? '/', `http://${host}:${port}`);
+
+      if (bearerToken) {
+        const auth = req.headers['authorization'];
+        const expected = `Bearer ${bearerToken}`;
+        if (auth !== expected) {
+          sendText(401, 'Unauthorized');
+          return;
+        }
+      }
+
+      if (req.method === 'GET' && url.pathname === healthPath) {
+        sendText(200, 'ok');
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === metricsPath) {
+        res.writeHead(200, {
+          'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        res.end(metrics.render());
+        return;
+      }
+
+      if (url.pathname === mcpPath) {
+        await transport.handleRequest(req as any, res as any);
+        return;
+      }
+
+      sendText(404, 'Not found');
+    });
+
+    process.on('SIGINT', () => void shutdown('SIGINT', httpServer));
+    process.on('SIGTERM', () => void shutdown('SIGTERM', httpServer));
+
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once('error', reject);
+      httpServer.listen(port, host, () => resolve());
+    });
+
+    logger.info('MCP server started', {
+      name: config.name,
+      version: config.version,
+      transport: 'http',
+      url: `http://${host}:${port}${mcpPath}`,
+      metrics: `http://${host}:${port}${metricsPath}`,
+      health: `http://${host}:${port}${healthPath}`,
+      connectors: registry.listIds(),
+    });
+
+    return;
+  }
+
   const transport = new StdioServerTransport();
 
-  // Handle shutdown gracefully
-  process.on('SIGINT', async () => {
-    await registry.disconnectAll();
-    await server.close();
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', async () => {
-    await registry.disconnectAll();
-    await server.close();
-    process.exit(0);
-  });
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   await server.connect(transport);
 
-  // Log to stderr (stdout is reserved for MCP protocol)
-  console.error(`MCP Server '${config.name}' v${config.version} started`);
-  console.error(`Registered connectors: ${registry.listIds().join(', ') || 'none'}`);
+  logger.info('MCP server started', {
+    name: config.name,
+    version: config.version,
+    transport: 'stdio',
+    connectors: registry.listIds(),
+  });
 }
 
 export { registry } from './connector-registry.js';

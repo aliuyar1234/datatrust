@@ -1,7 +1,7 @@
 {
-  "name": "@datatrust/trust-core",
+  "name": "@datatrust/entity-resolution",
   "version": "0.1.0",
-  "description": "Data trust layer for consistency monitoring and reconciliation",
+  "description": "LLM-powered entity resolution for intelligent data migration",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -10,19 +10,19 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./consistency": {
-      "types": "./dist/consistency/index.d.ts",
-      "import": "./dist/consistency/index.js"
+    "./similarity": {
+      "types": "./dist/similarity/index.d.ts",
+      "import": "./dist/similarity/index.js"
     },
-    "./formatters": {
-      "types": "./dist/formatters/index.d.ts",
-      "import": "./dist/formatters/index.js"
+    "./blocking": {
+      "types": "./dist/blocking/index.d.ts",
+      "import": "./dist/blocking/index.js"
     }
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/aliuyar1234/datatrust.git",
-    "directory": "packages/trust-core"
+    "directory": "packages/entity-resolution"
   },
   "homepage": "https://github.com/aliuyar1234/datatrust",
   "author": "Ali Uyar <ali.uyar1@hotmail.com>",
@@ -31,11 +31,13 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rimraf dist",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@datatrust/core": "workspace:*",
-    "@datatrust/entity-resolution": "workspace:*"
+    "fastest-levenshtein": "^1.0.16",
+    "cologne-phonetic": "^1.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

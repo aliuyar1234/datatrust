@@ -12,6 +12,7 @@ export type RuleOperator =
   | 'equals_tolerance' // Numeric match with tolerance
   | 'contains'         // String contains
   | 'regex'            // Regex pattern match
+  | 'similarity'       // Fuzzy string similarity
   | 'date_range';      // Date within range
 
 /**
@@ -34,6 +35,26 @@ export interface MatchingRule {
     dateRangeDays?: number;
     /** Case sensitivity for string operators */
     caseSensitive?: boolean;
+    /**
+     * For operator=regex: when true, interpret target values as raw regular expressions.
+     * Default: false (treat as a literal substring match to avoid ReDoS).
+     */
+    unsafeRegex?: boolean;
+    /** For operator=similarity: algorithm to use (default: "jaro_winkler") */
+    similarityAlgorithm?:
+      | 'levenshtein'
+      | 'jaro'
+      | 'jaro_winkler'
+      | 'dice_sorensen'
+      | 'jaccard'
+      | 'cologne_phonetic'
+      | 'soundex';
+    /** For operator=similarity: threshold between 0 and 1 (default: 0.85) */
+    similarityThreshold?: number;
+    /** For dice_sorensen/jaccard: n-gram size (default: 2) */
+    ngramSize?: number;
+    /** For jaro_winkler: prefix scale (default: 0.1, max: 0.25) */
+    prefixScale?: number;
   };
   /** Weight for confidence score calculation (1-100) */
   weight: number;
@@ -118,6 +139,24 @@ export interface ReconciliationReport {
 /**
  * Options for reconciliation
  */
+export interface BlockingOptions {
+  /**
+   * Blocking mode:
+   * - auto: use safe blocking derived from required equals rules when possible
+   * - configured: use sourceField/targetField + algorithm for blocking (falls back to full scan if no candidates)
+   * - off: disable blocking (full scan)
+   */
+  mode?: 'auto' | 'configured' | 'off';
+  /** Source field used for blocking in configured mode */
+  sourceField?: string;
+  /** Target field used for blocking in configured mode */
+  targetField?: string;
+  /** Blocking algorithm for configured mode (default: exact) */
+  algorithm?: 'exact' | 'prefix' | 'cologne_phonetic' | 'soundex';
+  /** Prefix length for algorithm=prefix (default: 4) */
+  prefixLength?: number;
+}
+
 export interface ReconciliationOptions {
   /** Matching rules to apply */
   rules: MatchingRule[];
@@ -129,4 +168,6 @@ export interface ReconciliationOptions {
   minConfidence?: number;
   /** Maximum records to process */
   maxRecords?: number;
+  /** Optional blocking configuration to reduce candidate comparisons */
+  blocking?: BlockingOptions;
 }

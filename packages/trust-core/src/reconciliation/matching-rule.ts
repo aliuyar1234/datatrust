@@ -6,6 +6,11 @@
 
 import type { MatchingRule, RuleOperator } from '../types/index.js';
 import { TrustError } from '../errors/index.js';
+import {
+  calculateSimilarity,
+  colognePhoneticSimilarity,
+  soundexSimilarity,
+} from '@datatrust/entity-resolution/similarity';
 
 /**
  * Result of evaluating a single rule
@@ -92,10 +97,13 @@ export class MatchingRuleEvaluator {
         return this.evaluateContains(sourceValue, targetValue, options);
 
       case 'regex':
-        return this.evaluateRegex(sourceValue, targetValue);
+        return this.evaluateRegex(sourceValue, targetValue, options);
+
+      case 'similarity':
+        return this.evaluateSimilarity(sourceValue, targetValue, options);
 
       case 'date_range':
-        return this.evaluateDateRange(sourceValue, targetValue, options);
+        return this.evaluateDateRange(sourceValue, targetValue, options);       
 
       default:
         throw new TrustError({
@@ -172,15 +180,85 @@ export class MatchingRuleEvaluator {
    */
   private evaluateRegex(
     sourceValue: unknown,
-    targetValue: unknown
+    targetValue: unknown,
+    options?: MatchingRule['options']
   ): boolean {
+    const sourceStr = String(sourceValue);
+    const targetStr = String(targetValue);
+
+    const caseSensitive = options?.caseSensitive ?? false;
+    const unsafeRegex = options?.unsafeRegex ?? false;
+
+    // Default to a safe literal contains check to avoid ReDoS on untrusted patterns.
+    if (!unsafeRegex) {
+      if (caseSensitive) {
+        return sourceStr.includes(targetStr);
+      }
+      return sourceStr.toLowerCase().includes(targetStr.toLowerCase());
+    }
+
+    // Guardrails for unsafe regex mode.
+    if (targetStr.length > 200 || sourceStr.length > 10_000) {
+      return false;
+    }
+
     try {
-      // Target value is the regex pattern
-      const pattern = new RegExp(String(targetValue), 'i');
-      return pattern.test(String(sourceValue));
+      const flags = caseSensitive ? '' : 'i';
+      const pattern = new RegExp(targetStr, flags);
+      return pattern.test(sourceStr);
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Fuzzy similarity match.
+   *
+   * Uses safe, deterministic algorithms (no regex backtracking). Intended for
+   * human-entered fields like names, references, and free text.
+   */
+  private evaluateSimilarity(
+    sourceValue: unknown,
+    targetValue: unknown,
+    options?: MatchingRule['options']
+  ): boolean {
+    const threshold = options?.similarityThreshold ?? 0.85;
+    if (threshold < 0 || threshold > 1) {
+      throw new TrustError({
+        code: 'INVALID_RULE',
+        message: `similarityThreshold must be between 0 and 1 (got ${threshold})`,
+      });
+    }
+
+    const algorithm = options?.similarityAlgorithm ?? 'jaro_winkler';
+    const caseSensitive = options?.caseSensitive ?? false;
+
+    let sourceStr = String(sourceValue);
+    let targetStr = String(targetValue);
+
+    if (!caseSensitive) {
+      sourceStr = sourceStr.toLowerCase();
+      targetStr = targetStr.toLowerCase();
+    }
+
+    if (sourceStr.length > 10_000 || targetStr.length > 10_000) {
+      return false;
+    }
+
+    let score: number;
+    if (algorithm === 'cologne_phonetic') {
+      score = colognePhoneticSimilarity(sourceStr, targetStr).score;
+    } else if (algorithm === 'soundex') {
+      score = soundexSimilarity(sourceStr, targetStr).score;
+    } else {
+      const similarity = calculateSimilarity(sourceStr, targetStr, algorithm, {
+        ngramSize: options?.ngramSize,
+        prefixScale: options?.prefixScale,
+      });
+      score = similarity.score;
+    }
+
+    return score >= threshold;
   }
 
   /**

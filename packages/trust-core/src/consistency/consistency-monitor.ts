@@ -4,6 +4,7 @@
  * Main class for comparing records across two IConnector instances.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { IConnector, Record as DataRecord } from '@datatrust/core';
 import type {
   IConsistencyMonitor,
@@ -22,7 +23,7 @@ import { RecordMatcher } from './record-matcher.js';
 
 /** Generate unique report ID */
 function generateReportId(): string {
-  return `report_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return `report_${randomUUID()}`;
 }
 
 export class ConsistencyMonitor implements IConsistencyMonitor {

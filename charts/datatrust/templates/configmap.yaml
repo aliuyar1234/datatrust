@@ -1,0 +1,10 @@
+{{- if and (not .Values.config.existingConfigMap) .Values.config.json -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "datatrust.fullname" . }}-config
+data:
+  config.json: |-
+{{ .Values.config.json | indent 4 }}
+{{- end -}}
+

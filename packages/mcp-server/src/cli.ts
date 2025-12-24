@@ -3,12 +3,21 @@
  * CLI entry point for the MCP server
  *
  * Usage:
- *   mcp-connectors --config ./config.json
+ *   datatrust --config ./config.json
  */
 
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { runServer, registry } from './server.js';
+import {
+  configFileSchema,
+  expandEnvVars,
+  formatZodError,
+  type ConfigFile,
+  type ConnectorEntry,
+} from './config.js';
+import { Logger } from './logger.js';
+import { instrumentConnector } from './instrument-connector.js';
 import {
   createCsvConnector,
   createJsonConnector,
@@ -17,99 +26,21 @@ import {
 import { createOdooConnector, createHubSpotConnector } from '@datatrust/connector-api';
 import { createPostgresConnector, createMySQLConnector } from '@datatrust/connector-db';
 
-/** File connector config */
-interface FileConnectorEntry {
-  id: string;
-  name: string;
-  type: 'csv' | 'json' | 'excel';
-  filePath: string;
-  readonly?: boolean;
-  delimiter?: string;
-  headers?: boolean;
-  recordsPath?: string;
-  sheet?: string | number;
-}
-
-/** Odoo connector config */
-interface OdooConnectorEntry {
-  id: string;
-  name: string;
-  type: 'odoo';
-  url: string;
-  database: string;
-  username: string;
-  password: string;
-  model: string;
-  readonly?: boolean;
-}
-
-/** HubSpot connector config */
-interface HubSpotConnectorEntry {
-  id: string;
-  name: string;
-  type: 'hubspot';
-  accessToken: string;
-  objectType: 'contacts' | 'companies' | 'deals' | 'tickets';
-  readonly?: boolean;
-}
-
-/** PostgreSQL connector config */
-interface PostgresConnectorEntry {
-  id: string;
-  name: string;
-  type: 'postgresql';
-  connectionString?: string;
-  host?: string;
-  port?: number;
-  database?: string;
-  user?: string;
-  password?: string;
-  ssl?: boolean | { rejectUnauthorized?: boolean };
-  table: string;
-  schema?: string;
-  primaryKey?: string;
-  readonly?: boolean;
-}
-
-/** MySQL connector config */
-interface MySQLConnectorEntry {
-  id: string;
-  name: string;
-  type: 'mysql';
-  uri?: string;
-  host?: string;
-  port?: number;
-  database?: string;
-  user?: string;
-  password?: string;
-  ssl?: boolean | { rejectUnauthorized?: boolean };
-  table: string;
-  primaryKey?: string;
-  readonly?: boolean;
-}
-
-type ConnectorConfigEntry =
-  | FileConnectorEntry
-  | OdooConnectorEntry
-  | HubSpotConnectorEntry
-  | PostgresConnectorEntry
-  | MySQLConnectorEntry;
-
-interface ConfigFile {
-  server?: {
-    name?: string;
-    version?: string;
-  };
-  connectors: ConnectorConfigEntry[];
-}
-
 async function loadConfig(configPath: string): Promise<ConfigFile> {
   const absolutePath = resolve(process.cwd(), configPath);
   const content = await readFile(absolutePath, 'utf-8');
-  return JSON.parse(content) as ConfigFile;
+  // Handle UTF-8 BOM (common on Windows) to avoid JSON.parse failures.
+  const sanitized = content.replace(/^\uFEFF/, '');
+  const parsed = JSON.parse(sanitized) as unknown;
+  const expanded = expandEnvVars(parsed);
+  const result = configFileSchema.safeParse(expanded);
+  if (!result.success) {
+    throw new Error(formatZodError(result.error));
+  }
+  return result.data;
 }
 
-function createConnector(entry: ConnectorConfigEntry) {
+function createConnector(entry: ConnectorEntry) {
   switch (entry.type) {
     case 'csv':
       return createCsvConnector({
@@ -117,8 +48,12 @@ function createConnector(entry: ConnectorConfigEntry) {
         name: entry.name,
         readonly: entry.readonly,
         filePath: resolve(process.cwd(), entry.filePath),
+        primaryKey: entry.primaryKey,
+        encoding: entry.encoding as BufferEncoding | undefined,
         delimiter: entry.delimiter,
         headers: entry.headers,
+        sanitizeFormulas: entry.sanitizeFormulas,
+        formulaEscapePrefix: entry.formulaEscapePrefix,
       });
 
     case 'json':
@@ -127,7 +62,11 @@ function createConnector(entry: ConnectorConfigEntry) {
         name: entry.name,
         readonly: entry.readonly,
         filePath: resolve(process.cwd(), entry.filePath),
+        primaryKey: entry.primaryKey,
+        encoding: entry.encoding as BufferEncoding | undefined,
         recordsPath: entry.recordsPath,
+        prettyPrint: entry.prettyPrint,
+        indent: entry.indent,
       });
 
     case 'excel':
@@ -136,8 +75,12 @@ function createConnector(entry: ConnectorConfigEntry) {
         name: entry.name,
         readonly: entry.readonly,
         filePath: resolve(process.cwd(), entry.filePath),
+        primaryKey: entry.primaryKey,
+        encoding: entry.encoding as BufferEncoding | undefined,
         sheet: entry.sheet,
         headers: entry.headers,
+        startRow: entry.startRow,
+        startColumn: entry.startColumn,
       });
 
     case 'odoo':
@@ -150,15 +93,25 @@ function createConnector(entry: ConnectorConfigEntry) {
         username: entry.username,
         password: entry.password,
         model: entry.model,
+        timeoutMs: entry.timeoutMs,
       });
 
     case 'hubspot':
+      // config validation guarantees that at least one of these is present.
+      // HubSpot connector itself expects a Private App access token.
+      const accessToken = entry.accessToken ?? entry.apiKey;
+      if (!accessToken) {
+        throw new Error(
+          'HubSpot connector requires accessToken (or deprecated apiKey)'
+        );
+      }
       return createHubSpotConnector({
         id: entry.id,
         name: entry.name,
         readonly: entry.readonly,
-        accessToken: entry.accessToken,
+        accessToken,
         objectType: entry.objectType,
+        timeoutMs: entry.timeoutMs,
       });
 
     case 'postgresql':
@@ -200,12 +153,13 @@ function createConnector(entry: ConnectorConfigEntry) {
 }
 
 async function main(): Promise<void> {
+  let logger = new Logger();
   const args = process.argv.slice(2);
   const configIndex = args.indexOf('--config');
   const configPath = configIndex !== -1 ? args[configIndex + 1] : null;
 
   if (!configPath) {
-    console.error('Usage: mcp-connectors --config <config.json>');
+    console.error('Usage: datatrust --config <config.json>');
     console.error('');
     console.error('Supported connector types: csv, json, excel, odoo, hubspot, postgresql, mysql');
     console.error('');
@@ -222,9 +176,13 @@ async function main(): Promise<void> {
 
   try {
     const config = await loadConfig(configPath);
+    logger = new Logger({
+      level: config.server?.logging?.level,
+      format: config.server?.logging?.format,
+    });
 
     for (const entry of config.connectors) {
-      const connector = createConnector(entry);
+      const connector = instrumentConnector(createConnector(entry), logger);
       registry.register(connector);
     }
 
@@ -233,9 +191,14 @@ async function main(): Promise<void> {
     await runServer({
       name: config.server?.name ?? 'mcp-enterprise-connectors',
       version: config.server?.version ?? '0.1.0',
+      transport: config.server?.transport,
+      http: config.server?.http,
+      policy: config.server?.policy,
+      logging: config.server?.logging,
+      logger,
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    logger.error('Failed to start server', { error });
     process.exit(1);
   }
 }

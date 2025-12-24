@@ -1,0 +1,16 @@
+**/node_modules
+**/dist
+**/.git
+**/.github
+**/.vscode
+**/.idea
+**/.DS_Store
+**/tmp
+**/temp
+**/*.log
+coverage
+.audit-logs
+.snapshots
+.policy-audit
+.claude
+CLAUDE.md

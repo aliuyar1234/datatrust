@@ -1,0 +1,36 @@
+image:
+  repository: datatrust/mcp-server
+  tag: ""
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 3333
+
+config:
+  # Use an existing ConfigMap containing `config.json`.
+  existingConfigMap: ""
+  # Or provide config.json inline (creates a ConfigMap).
+  json: |
+    {
+      "server": {
+        "name": "datatrust",
+        "version": "0.1.0",
+        "transport": "http",
+        "http": { "host": "0.0.0.0", "port": 3333, "path": "/mcp", "metricsPath": "/metrics", "healthPath": "/healthz" }
+      },
+      "connectors": []
+    }
+
+env: []
+  # - name: HUBSPOT_ACCESS_TOKEN
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: hubspot
+  #       key: accessToken
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
