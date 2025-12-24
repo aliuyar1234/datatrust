@@ -32,6 +32,8 @@ export interface HubSpotConnectorConfig extends ConnectorConfig {
   accessToken: string;
   /** CRM object type */
   objectType: HubSpotObjectType;
+  /** Request timeout in milliseconds (default: 30000) */
+  timeoutMs?: number;
 }
 
 /** Map HubSpot field types to our types */
@@ -77,6 +79,7 @@ export class HubSpotConnector implements IConnector<HubSpotConnectorConfig> {
     try {
       this._client = new HubSpotClient({
         accessToken: this.config.accessToken,
+        timeoutMs: this.config.timeoutMs,
       });
 
       const connected = await this._client.testConnection();
@@ -346,7 +349,10 @@ export class HubSpotConnector implements IConnector<HubSpotConnectorConfig> {
 
   async testConnection(): Promise<boolean> {
     if (!this._client) {
-      const client = new HubSpotClient({ accessToken: this.config.accessToken });
+      const client = new HubSpotClient({
+        accessToken: this.config.accessToken,
+        timeoutMs: this.config.timeoutMs,
+      });
       return client.testConnection();
     }
     return this._client.testConnection();

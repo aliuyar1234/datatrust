@@ -16,6 +16,8 @@ export interface OdooClientConfig {
   username: string;
   /** Password or API key */
   password: string;
+  /** Request timeout in milliseconds (default: 30000) */
+  timeoutMs?: number;
 }
 
 interface JsonRpcRequest {
@@ -240,14 +242,38 @@ export class OdooClient {
     };
 
     const endpoint = `${this.config.url}/jsonrpc`;
+    const timeoutMs = this.config.timeoutMs ?? 30_000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(request),
-    });
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if ((err as { name?: string }).name === 'AbortError') {
+        throw new ConnectorError({
+          code: 'TIMEOUT',
+          message: `Odoo request timed out after ${timeoutMs}ms`,
+          suggestion: 'Increase timeoutMs or check network connectivity.',
+        });
+      }
+
+      throw new ConnectorError({
+        code: 'CONNECTION_FAILED',
+        message: `Failed to connect to Odoo server: ${(err as Error).message}`,
+        suggestion: 'Check the Odoo server URL and network connectivity.',
+        cause: err instanceof Error ? err : undefined,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       throw new ConnectorError({

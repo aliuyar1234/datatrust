@@ -108,7 +108,7 @@ export function applyFilter(records: Record[], options?: FilterOptions): Record[
     result = result.map((record) => {
       const selected: Record = {};
       for (const field of selectedFields) {
-        if (field in record) {
+        if (Object.prototype.hasOwnProperty.call(record, field)) {
           selected[field] = record[field];
         }
       }

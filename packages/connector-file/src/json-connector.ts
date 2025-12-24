@@ -20,17 +20,54 @@ export interface JsonConnectorConfig extends FileConnectorConfig {
   indent?: number;
 }
 
+const FORBIDDEN_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
+
+function parseSafePath(path: string, connectorId: string): string[] {
+  const parts = path.split('.');
+  if (parts.length === 0 || parts.some((p) => p.length === 0)) {
+    throw new ConnectorError({
+      code: 'CONFIGURATION_ERROR',
+      message: `Invalid recordsPath: "${path}"`,
+      connectorId,
+      suggestion: 'Use dot notation with non-empty segments (e.g., "data.items").',
+    });
+  }
+
+  for (const part of parts) {
+    if (FORBIDDEN_PATH_SEGMENTS.has(part)) {
+      throw new ConnectorError({
+        code: 'CONFIGURATION_ERROR',
+        message: `Unsafe recordsPath segment: "${part}"`,
+        connectorId,
+        suggestion:
+          'Avoid __proto__/prototype/constructor in recordsPath to prevent prototype pollution.',
+      });
+    }
+  }
+
+  return parts;
+}
+
 /**
  * Get nested value from object using dot notation path
  */
-function getNestedValue(obj: unknown, path: string): unknown {
-  const parts = path.split('.');
+function getNestedValue(obj: unknown, path: string, connectorId: string): unknown {
+  const parts = parseSafePath(path, connectorId);
   let current = obj;
 
   for (const part of parts) {
     if (current === null || current === undefined) {
       return undefined;
     }
+
+    if (typeof current !== 'object') {
+      return undefined;
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(current, part)) {
+      return undefined;
+    }
+
     current = (current as Record)[part];
   }
 
@@ -40,15 +77,26 @@ function getNestedValue(obj: unknown, path: string): unknown {
 /**
  * Set nested value in object using dot notation path
  */
-function setNestedValue(obj: Record, path: string, value: unknown): void {
-  const parts = path.split('.');
+function setNestedValue(
+  obj: Record,
+  path: string,
+  value: unknown,
+  connectorId: string
+): void {
+  const parts = parseSafePath(path, connectorId);
   let current = obj;
 
   for (let i = 0; i < parts.length - 1; i++) {
     const part = parts[i]!;
-    if (!(part in current)) {
-      current[part] = {};
+
+    const next = Object.prototype.hasOwnProperty.call(current, part)
+      ? current[part]
+      : undefined;
+
+    if (next === null || next === undefined || typeof next !== 'object') {
+      current[part] = Object.create(null);
     }
+
     current = current[part] as Record;
   }
 
@@ -69,7 +117,11 @@ export class JsonConnector extends BaseFileConnector<JsonConnectorConfig> {
 
       // If recordsPath is specified, extract from that path
       if (this.config.recordsPath) {
-        const records = getNestedValue(parsed, this.config.recordsPath);
+        const records = getNestedValue(
+          parsed,
+          this.config.recordsPath,
+          this.config.id
+        );
 
         if (!Array.isArray(records)) {
           throw new ConnectorError({
@@ -114,11 +166,14 @@ export class JsonConnector extends BaseFileConnector<JsonConnectorConfig> {
 
     // If we have a recordsPath, preserve the original structure
     if (this.config.recordsPath && this._originalStructure) {
-      const output =
-        typeof this._originalStructure === 'object'
-          ? { ...(this._originalStructure as Record) }
-          : {};
-      setNestedValue(output, this.config.recordsPath, records);
+      const output: Record = Object.create(null);
+      if (typeof this._originalStructure === 'object' && this._originalStructure) {
+        for (const key of Object.keys(this._originalStructure as Record)) {
+          output[key] = (this._originalStructure as Record)[key];
+        }
+      }
+
+      setNestedValue(output, this.config.recordsPath, records, this.config.id);
       return JSON.stringify(output, null, indent);
     }
 

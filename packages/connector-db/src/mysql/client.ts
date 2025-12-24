@@ -47,10 +47,14 @@ const VALID_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 /**
  * Validate that a string is a safe SQL identifier
  */
-function validateIdentifier(name: string, type: string): void {
+function validateIdentifier(
+  name: string,
+  type: string,
+  errorCode: 'READ_FAILED' | 'WRITE_FAILED' = 'READ_FAILED'
+): void {
   if (!VALID_IDENTIFIER.test(name)) {
     throw new ConnectorError({
-      code: 'READ_FAILED',
+      code: errorCode,
       message: `Invalid ${type} name: "${name}". Must be alphanumeric with underscores, starting with a letter or underscore.`,
       suggestion: `Use only valid SQL identifiers for ${type} names.`,
     });
@@ -60,11 +64,16 @@ function validateIdentifier(name: string, type: string): void {
 /**
  * Validate column names against a whitelist from schema
  */
-function validateColumns(columns: string[], allowedColumns: Set<string>, context: string): void {
+function validateColumns(
+  columns: string[],
+  allowedColumns: Set<string>,
+  context: string,
+  errorCode: 'READ_FAILED' | 'WRITE_FAILED' = 'READ_FAILED'
+): void {
   for (const col of columns) {
     if (!allowedColumns.has(col)) {
       throw new ConnectorError({
-        code: 'READ_FAILED',
+        code: errorCode,
         message: `Invalid column "${col}" in ${context}. Column does not exist in table schema.`,
         suggestion: `Valid columns: ${Array.from(allowedColumns).join(', ')}`,
       });
@@ -340,8 +349,22 @@ export class MySQLClient {
     table: string,
     values: Record<string, unknown>
   ): Promise<number> {
+    // Validate table name to prevent SQL injection
+    validateIdentifier(table, 'table', 'WRITE_FAILED');
+
+    const allowedColumns = await this.getAllowedColumns(table);
     const columns = Object.keys(values);
-    const params = Object.values(values);
+    if (columns.length === 0) {
+      throw new ConnectorError({
+        code: 'WRITE_FAILED',
+        message: 'Cannot insert: no values provided',
+        suggestion: 'Provide at least one column/value pair to insert.',
+      });
+    }
+
+    validateColumns(columns, allowedColumns, 'INSERT', 'WRITE_FAILED');
+
+    const params = columns.map((c) => values[c]);
     const placeholders = columns.map(() => '?').join(', ');
 
     const sql = `INSERT INTO \`${table}\` (${columns.map((c) => `\`${c}\``).join(', ')}) VALUES (${placeholders})`;
@@ -358,8 +381,37 @@ export class MySQLClient {
     values: Record<string, unknown>,
     where: { column: string; value: unknown }[]
   ): Promise<number> {
+    // Validate table name to prevent SQL injection
+    validateIdentifier(table, 'table', 'WRITE_FAILED');
+
+    if (where.length === 0) {
+      throw new ConnectorError({
+        code: 'WRITE_FAILED',
+        message: 'Refusing to update without a WHERE clause',
+        suggestion:
+          'Provide at least one WHERE condition to avoid full-table updates.',
+      });
+    }
+
+    const allowedColumns = await this.getAllowedColumns(table);
     const setCols = Object.keys(values);
-    const params: unknown[] = [...Object.values(values)];
+    if (setCols.length === 0) {
+      throw new ConnectorError({
+        code: 'WRITE_FAILED',
+        message: 'Cannot update: no values provided',
+        suggestion: 'Provide at least one column/value pair to update.',
+      });
+    }
+
+    validateColumns(setCols, allowedColumns, 'SET', 'WRITE_FAILED');
+    validateColumns(
+      where.map((w) => w.column),
+      allowedColumns,
+      'WHERE',
+      'WRITE_FAILED'
+    );
+
+    const params: unknown[] = setCols.map((c) => values[c]);
 
     const setClause = setCols.map((c) => `\`${c}\` = ?`).join(', ');
     const whereClause = where
@@ -382,6 +434,26 @@ export class MySQLClient {
     table: string,
     where: { column: string; value: unknown }[]
   ): Promise<number> {
+    // Validate table name to prevent SQL injection
+    validateIdentifier(table, 'table', 'WRITE_FAILED');
+
+    if (where.length === 0) {
+      throw new ConnectorError({
+        code: 'WRITE_FAILED',
+        message: 'Refusing to delete without a WHERE clause',
+        suggestion:
+          'Provide at least one WHERE condition to avoid full-table deletes.',
+      });
+    }
+
+    const allowedColumns = await this.getAllowedColumns(table);
+    validateColumns(
+      where.map((w) => w.column),
+      allowedColumns,
+      'WHERE',
+      'WRITE_FAILED'
+    );
+
     const params: unknown[] = [];
 
     const whereClause = where

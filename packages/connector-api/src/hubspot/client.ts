@@ -12,6 +12,8 @@ export interface HubSpotClientConfig {
   accessToken: string;
   /** API base URL (default: https://api.hubspot.com) */
   baseUrl?: string;
+  /** Request timeout in milliseconds (default: 30000) */
+  timeoutMs?: number;
 }
 
 /** HubSpot CRM object types */
@@ -246,15 +248,38 @@ export class HubSpotClient {
     body?: unknown
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
+    const timeoutMs = this.config.timeoutMs ?? 30_000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    const response = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.config.accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.config.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if ((err as { name?: string }).name === 'AbortError') {
+        throw new ConnectorError({
+          code: 'TIMEOUT',
+          message: `HubSpot request timed out after ${timeoutMs}ms`,
+          suggestion: 'Increase timeoutMs or check network connectivity.',
+        });
+      }
+
+      throw new ConnectorError({
+        code: 'CONNECTION_FAILED',
+        message: `Failed to connect to HubSpot API: ${(err as Error).message}`,
+        cause: err instanceof Error ? err : undefined,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       let errorMessage = `HTTP ${response.status}`;

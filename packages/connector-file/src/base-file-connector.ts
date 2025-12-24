@@ -13,6 +13,7 @@ import type {
   FilterOptions,
   ReadResult,
   WriteResult,
+  WriteError,
   ValidationResult,
   Record,
   FieldDefinition,
@@ -20,11 +21,18 @@ import type {
 } from '@datatrust/core';
 import { ConnectorError, applyFilter, countMatching } from '@datatrust/core';
 
+const FORBIDDEN_RECORD_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
 export interface FileConnectorConfig extends ConnectorConfig {
   /** Path to the file */
   filePath: string;
   /** Character encoding (default: utf-8) */
   encoding?: BufferEncoding;
+  /**
+   * Field(s) used to match existing records for update/upsert.
+   * If omitted, file connectors auto-detect a single key field ('id'/'ID') when present.
+   */
+  primaryKey?: string | string[];
 }
 
 /**
@@ -153,7 +161,7 @@ export function inferSchemaFromRecords(
 /**
  * Abstract base class for file connectors
  */
-export abstract class BaseFileConnector<TConfig extends FileConnectorConfig>
+export abstract class BaseFileConnector<TConfig extends FileConnectorConfig>    
   implements IConnector<TConfig>
 {
   readonly config: TConfig;
@@ -183,9 +191,14 @@ export abstract class BaseFileConnector<TConfig extends FileConnectorConfig>
       );
 
       this._records = await this.parseContent(content);
+      this.ensureSafeRecordKeys(this._records, 'read');
       this._state = 'connected';
     } catch (error) {
       this._state = 'error';
+
+      if (error instanceof ConnectorError) {
+        throw error;
+      }
 
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         throw new ConnectorError({
@@ -253,7 +266,7 @@ export abstract class BaseFileConnector<TConfig extends FileConnectorConfig>
 
   async writeRecords(
     records: Record[],
-    _mode: 'insert' | 'update' | 'upsert' = 'insert'
+    mode: 'insert' | 'update' | 'upsert' = 'insert'
   ): Promise<WriteResult> {
     this.ensureConnected();
 
@@ -267,9 +280,135 @@ export abstract class BaseFileConnector<TConfig extends FileConnectorConfig>
     }
 
     try {
-      // For file connectors, we append new records
-      // TODO: Implement update/upsert with primary key matching
-      this._records.push(...records);
+      if (records.length === 0) {
+        return { success: 0, failed: 0 };
+      }
+
+      this.ensureSafeRecordKeys(records, 'write');
+
+      const errors: WriteError[] = [];
+      const ids: Array<string | number> = [];
+
+      const configuredKeyFields = this.config.primaryKey
+        ? Array.isArray(this.config.primaryKey)
+          ? this.config.primaryKey
+          : [this.config.primaryKey]
+        : null;
+
+      const autoKeyField =
+        configuredKeyFields?.length
+          ? null
+          : records.every(
+                (r) => r['id'] !== undefined && r['id'] !== null && r['id'] !== ''
+              )
+            ? 'id'
+            : records.every(
+                  (r) => r['ID'] !== undefined && r['ID'] !== null && r['ID'] !== ''
+                )
+              ? 'ID'
+              : null;
+
+      const keyFields = configuredKeyFields?.length
+        ? configuredKeyFields
+        : autoKeyField
+          ? [autoKeyField]
+          : null;
+
+      if (mode === 'update' && !keyFields) {
+        throw new ConnectorError({
+          code: 'UNSUPPORTED_OPERATION',
+          message:
+            'Cannot update file records without a primary key. Configure primaryKey on the connector.',
+          connectorId: this.config.id,
+          suggestion:
+            'Set primaryKey (e.g., "id") so file connectors can match existing records for updates.',
+        });
+      }
+
+      // Fast-path: insert (or upsert without a usable key)
+      if (mode === 'insert' || !keyFields) {
+        this._records.push(...records);
+        for (const record of records) {
+          const id = record['id'];
+          if (typeof id === 'string' || typeof id === 'number') {
+            ids.push(id);
+          } else if (id !== undefined && id !== null) {
+            ids.push(String(id));
+          }
+        }
+      } else {
+        const buildKey = (record: Record): string | null => {
+          const values = keyFields.map((field) => record[field]);
+          if (values.some((v) => v === undefined || v === null || v === '')) {
+            return null;
+          }
+          return JSON.stringify(values);
+        };
+
+        const existingIndexByKey = new Map<string, number>();
+        for (let i = 0; i < this._records.length; i++) {
+          const key = buildKey(this._records[i]!);
+          if (key) existingIndexByKey.set(key, i);
+        }
+
+        for (let index = 0; index < records.length; index++) {
+          const record = records[index]!;
+          const key = buildKey(record);
+
+          if (!key) {
+            if (mode === 'upsert') {
+              this._records.push(record);
+              continue;
+            }
+
+            errors.push({
+              index,
+              message: `Missing primary key field(s): ${keyFields.join(', ')}`,
+              record,
+            });
+            continue;
+          }
+
+          const existingIndex = existingIndexByKey.get(key);
+
+          if (existingIndex === undefined) {
+            if (mode === 'update') {
+              errors.push({
+                index,
+                message: `No existing record found for primary key: ${keyFields.join(', ')}`,
+                record,
+              });
+              continue;
+            }
+
+            this._records.push(record);
+            existingIndexByKey.set(key, this._records.length - 1);
+          } else {
+            const existing = this._records[existingIndex];
+            if (!existing) {
+              errors.push({
+                index,
+                message: `Internal error: matched index ${existingIndex} not found`,
+                record,
+              });
+              continue;
+            }
+
+            for (const field of Object.keys(record)) {
+              existing[field] = record[field];
+            }
+          }
+
+          if (keyFields.length === 1) {
+            const id = record[keyFields[0]!];
+            if (typeof id === 'string' || typeof id === 'number') {
+              ids.push(id);
+            } else if (id !== undefined && id !== null) {
+              ids.push(String(id));
+            }
+          }
+        }
+      }
 
       // Serialize and write back to file
       const content = await this.serializeContent(this._records);
@@ -279,20 +418,46 @@ export abstract class BaseFileConnector<TConfig extends FileConnectorConfig>
       this._schema = null;
 
       return {
-        success: records.length,
-        failed: 0,
+        success: records.length - errors.length,
+        failed: errors.length,
+        errors: errors.length > 0 ? errors : undefined,
+        ids: ids.length > 0 ? ids : undefined,
       };
     } catch (error) {
+      if (error instanceof ConnectorError) {
+        throw error;
+      }
       throw new ConnectorError({
         code: 'WRITE_FAILED',
-        message: `Failed to write records: ${(error as Error).message}`,
+        message: `Failed to write records: ${(error as Error).message}`,        
         connectorId: this.config.id,
         cause: error instanceof Error ? error : undefined,
       });
     }
   }
 
-  async validateRecords(records: Record[]): Promise<ValidationResult[]> {
+  private ensureSafeRecordKeys(
+    records: Record[],
+    operation: 'read' | 'write'
+  ): void {
+    for (let index = 0; index < records.length; index++) {
+      const record = records[index]!;
+      for (const key of Object.keys(record)) {
+        if (!FORBIDDEN_RECORD_KEYS.has(key)) continue;
+
+        throw new ConnectorError({
+          code: operation === 'read' ? 'SCHEMA_MISMATCH' : 'VALIDATION_ERROR',
+          message: `Unsafe record key: ${key}`,
+          connectorId: this.config.id,
+          suggestion:
+            'Avoid __proto__/prototype/constructor keys to prevent prototype pollution.',
+          context: { index, key, operation },
+        });
+      }
+    }
+  }
+
+  async validateRecords(records: Record[]): Promise<ValidationResult[]> {       
     const schema = await this.getSchema();
     const results: ValidationResult[] = [];
 

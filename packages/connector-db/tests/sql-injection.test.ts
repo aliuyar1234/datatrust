@@ -86,6 +86,38 @@ describe('SQL identifier validation', () => {
     expect(params).toEqual([1]);
   });
 
+  it('rejects malicious column names in PostgreSQL insert/update/delete', async () => {
+    const client = new PostgresClient({});
+
+    await expect(
+      client.insert(
+        'invoices',
+        { 'id;DROP TABLE users;': 1 },
+        { schema: 'public', returning: ['id'] }
+      )
+    ).rejects.toBeInstanceOf(ConnectorError);
+    expect(pgQueries).toHaveLength(0);
+
+    await expect(
+      client.update(
+        'invoices',
+        { amount: 10 },
+        [{ column: 'id;DROP TABLE users;', value: 1 }],
+        { schema: 'public' }
+      )
+    ).rejects.toBeInstanceOf(ConnectorError);
+    expect(pgQueries).toHaveLength(0);
+
+    await expect(
+      client.delete(
+        'invoices',
+        [{ column: 'id;DROP TABLE users;', value: 1 }],
+        { schema: 'public' }
+      )
+    ).rejects.toBeInstanceOf(ConnectorError);
+    expect(pgQueries).toHaveLength(0);
+  });
+
   it('rejects malicious column names in MySQL queries', async () => {
     const client = new MySQLClient({});
     await expect(
@@ -109,5 +141,24 @@ describe('SQL identifier validation', () => {
     const { sql, params } = mysqlQueries[0]!;
     expect(sql).toContain('`id` = ?');
     expect(params).toEqual([99]);
+  });
+
+  it('rejects malicious column names in MySQL insert/update/delete', async () => {
+    const client = new MySQLClient({});
+
+    await expect(
+      client.insert('orders', { 'id;DROP TABLE users;': 1 })
+    ).rejects.toBeInstanceOf(ConnectorError);
+    expect(mysqlQueries).toHaveLength(0);
+
+    await expect(
+      client.update('orders', { total: 10 }, [{ column: 'id;DROP', value: 1 }])
+    ).rejects.toBeInstanceOf(ConnectorError);
+    expect(mysqlQueries).toHaveLength(0);
+
+    await expect(
+      client.delete('orders', [{ column: 'id;DROP', value: 1 }])
+    ).rejects.toBeInstanceOf(ConnectorError);
+    expect(mysqlQueries).toHaveLength(0);
   });
 });

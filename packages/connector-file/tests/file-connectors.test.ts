@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import ExcelJS from 'exceljs';
@@ -86,5 +86,65 @@ describe('File connector edge cases', () => {
 
     expect(result.records).toHaveLength(1);
     expect(result.records[0]?.nested).toEqual({ a: 1, b: 'x' });
+  });
+
+  it('upserts by id for JSON connector', async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'connector-file-'));
+    const filePath = join(tmpDir, 'upsert.json');
+    writeFileSync(
+      filePath,
+      JSON.stringify([{ id: 1, name: 'Alice', amount: 10 }], null, 2),
+      'utf-8'
+    );
+
+    const connector = createJsonConnector({
+      id: 'json-upsert',
+      name: 'upsert',
+      filePath,
+    });
+
+    await connector.connect();
+    await connector.writeRecords([{ id: 1, amount: 20 }], 'upsert');
+
+    const result = await connector.readRecords();
+    expect(result.records).toHaveLength(1);
+    expect(result.records[0]?.amount).toBe(20);
+    expect(result.records[0]?.name).toBe('Alice');
+  });
+
+  it('sanitizes CSV formulas on write', async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'connector-file-'));
+    const filePath = join(tmpDir, 'formulas.csv');
+    writeFileSync(filePath, '', 'utf-8');
+
+    const connector = createCsvConnector({
+      id: 'csv-formulas',
+      name: 'formulas',
+      filePath,
+      headers: true,
+    });
+
+    await connector.connect();
+    await connector.writeRecords([{ name: '=2+2' }], 'insert');
+
+    const content = readFileSync(filePath, 'utf-8');
+    expect(content).toContain("'=2+2");
+  });
+
+  it('rejects unsafe recordsPath segments in JSON connector', async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'connector-file-'));
+    const filePath = join(tmpDir, 'unsafe-path.json');
+    writeFileSync(filePath, JSON.stringify({ data: { items: [] } }), 'utf-8');
+
+    const connector = createJsonConnector({
+      id: 'json-unsafe-path',
+      name: 'unsafe-path',
+      filePath,
+      recordsPath: '__proto__.polluted',
+    });
+
+    await expect(connector.connect()).rejects.toMatchObject({
+      code: 'CONFIGURATION_ERROR',
+    });
   });
 });

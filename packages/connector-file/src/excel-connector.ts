@@ -23,7 +23,9 @@ export interface ExcelConnectorConfig extends FileConnectorConfig {
   startColumn?: number;
 }
 
-export class ExcelConnector extends BaseFileConnector<ExcelConnectorConfig> {
+const FORBIDDEN_RECORD_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+export class ExcelConnector extends BaseFileConnector<ExcelConnectorConfig> {   
   private _workbook: ExcelJS.Workbook | null = null;
 
   constructor(config: Omit<ExcelConnectorConfig, 'type'> & { type?: 'excel' }) {
@@ -54,11 +56,22 @@ export class ExcelConnector extends BaseFileConnector<ExcelConnectorConfig> {
     const headers: string[] = [];
     if (hasHeaders) {
       const headerRow = sheet.getRow(startRow);
-      headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {        
         if (colNumber >= startColumn) {
           headers[colNumber - startColumn] = String(cell.value ?? `Column${colNumber}`);
         }
       });
+
+      for (const header of headers) {
+        if (FORBIDDEN_RECORD_KEYS.has(header)) {
+          throw new ConnectorError({
+            code: 'SCHEMA_MISMATCH',
+            message: `Unsafe Excel header name: ${header}`,
+            connectorId: this.config.id,
+            suggestion: 'Rename the column to a safe field name and try again.',
+          });
+        }
+      }
     } else {
       // Generate column names (A, B, C, ... AA, AB, etc.)
       const colCount = sheet.columnCount;
@@ -74,7 +87,7 @@ export class ExcelConnector extends BaseFileConnector<ExcelConnectorConfig> {
     sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber < dataStartRow) return;
 
-      const record: Record = {};
+      const record: Record = Object.create(null);
       let hasData = false;
 
       row.eachCell({ includeEmpty: true }, (cell, colNumber) => {

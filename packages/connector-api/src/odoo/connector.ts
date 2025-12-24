@@ -34,6 +34,8 @@ export interface OdooConnectorConfig extends ConnectorConfig {
   password: string;
   /** Odoo model to connect to (e.g., 'res.partner', 'account.move') */
   model: string;
+  /** Request timeout in milliseconds (default: 30000) */
+  timeoutMs?: number;
 }
 
 /** Map Odoo field types to our types */
@@ -77,6 +79,7 @@ export class OdooConnector implements IConnector<OdooConnectorConfig> {
         database: this.config.database,
         username: this.config.username,
         password: this.config.password,
+        timeoutMs: this.config.timeoutMs,
       };
 
       this._client = new OdooClient(clientConfig);
@@ -308,6 +311,7 @@ export class OdooConnector implements IConnector<OdooConnectorConfig> {
           database: this.config.database,
           username: this.config.username,
           password: this.config.password,
+          timeoutMs: this.config.timeoutMs,
         };
         const testClient = new OdooClient(clientConfig);
         await testClient.version();
